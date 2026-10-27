@@ -582,12 +582,31 @@ function viewProgress() {
     </div>`;
 }
 
+function isStandalone() {
+  try {
+    return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  } catch {
+    return false;
+  }
+}
+
 function viewSettings() {
   const profile = App.boot.profile;
   const plan = App.boot.plan;
   const aiNotes = (plan && plan.aiNotes) || null;
   const targetLabel = (TARGET_OPTIONS.find((t) => t.id === profile.target) || {}).label || profile.target;
+  const installCard = isStandalone()
+    ? ''
+    : `<div class="card" style="border-color:var(--accent)">
+      <h3 style="font-size:15px">装到手机主屏</h3>
+      <p class="muted" style="margin-top:6px;font-size:13.5px">装完就真的像个小 App：有自己的图标、全屏打开、断网也能学。</p>
+      <ol style="margin:10px 0 0 18px;font-size:13.5px;line-height:1.9">
+        <li>用手机浏览器打开这个页面</li>
+        <li>点浏览器菜单里的「添加到主屏幕」或「安装应用」</li>
+      </ol>
+    </div>`;
   return `
+    ${installCard}
     <div class="card">
       <h3 style="font-size:15px">我的档案</h3>
       <div style="margin-top:12px;font-size:15px;line-height:2">
