@@ -1,13 +1,13 @@
 /* 英语教练 · 离线缓存
    缓存优先、后台更新：装到主屏以后，断网也能打开，学的东西都还在。 */
-const CACHE = 'english-coach-v2';
+const CACHE = 'english-coach-v3';
 const ASSETS = [
   './',
   './index.html',
   './styles.css',
-  './content.js?v=2',
-  './engine.js?v=2',
-  './app.js?v=2',
+  './content.js?v=3',
+  './engine.js?v=3',
+  './app.js?v=3',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

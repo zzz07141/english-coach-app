@@ -601,9 +601,10 @@ function viewSettings() {
       <h3 style="font-size:15px">装到手机主屏</h3>
       <p class="muted" style="margin-top:6px;font-size:13.5px">装完就真的像个小 App：有自己的图标、全屏打开、断网也能学。</p>
       <ol style="margin:10px 0 0 18px;font-size:13.5px;line-height:1.9">
-        <li>用手机浏览器打开这个页面</li>
-        <li>点浏览器菜单里的「添加到主屏幕」或「安装应用」</li>
+        <li>用 Chrome、Edge 或 Safari 打开这个页面</li>
+        <li>点浏览器菜单里的「安装应用」或「添加到主屏幕」</li>
       </ol>
+      <p class="muted" style="margin-top:10px;font-size:12.5px;line-height:1.7">菜单里要是没有这两项，说明你用的浏览器不支持装 PWA——微信/QQ 里点开的、夸克、UC、火狐、iPhone 上的 Chrome 都属于这类。换成 Chrome 或 Safari 重开一次就有。</p>
     </div>`;
   return `
     ${installCard}
