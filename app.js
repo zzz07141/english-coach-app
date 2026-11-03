@@ -590,22 +590,72 @@ function isStandalone() {
   }
 }
 
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+});
+
+function browserInfo() {
+  const ua = navigator.userAgent || '';
+  const isEdge = /Edg\//.test(ua);
+  const isSamsung = /SamsungBrowser/.test(ua);
+  const isChrome = /Chrome\//.test(ua) && !isEdge && !isSamsung;
+  const isSafari = /Safari\//.test(ua) && !/Chrome\//.test(ua) && !/Edg\//.test(ua) && !/Android/.test(ua);
+  const isIOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isWeChat = /MicroMessenger/.test(ua);
+  const isQQ = /MQQBrowser|QQBrowser/.test(ua) && !isWeChat;
+  const isUC = /UCBrowser/.test(ua);
+  const isQuark = /Quark/.test(ua);
+  const isFirefox = /Firefox\//.test(ua);
+  let name = '这个浏览器';
+  if (isWeChat) name = '微信内置浏览器';
+  else if (isEdge) name = 'Edge';
+  else if (isSamsung) name = '三星浏览器';
+  else if (isChrome) name = 'Chrome';
+  else if (isSafari) name = 'Safari';
+  else if (isQuark) name = '夸克';
+  else if (isUC) name = 'UC 浏览器';
+  else if (isQQ) name = 'QQ 浏览器';
+  else if (isFirefox) name = '火狐';
+  let supported = isChrome || isEdge || isSamsung || isSafari || !!deferredPrompt;
+  if (isIOS) supported = isSafari;
+  if (isWeChat || isQQ || isUC || isQuark || isFirefox) supported = !!deferredPrompt;
+  return { name, supported, isIOS };
+}
+
+function installCardHtml() {
+  if (isStandalone()) return '';
+  const info = browserInfo();
+  let body = '';
+  if (deferredPrompt) {
+    body =
+      '<p class="muted" style="margin-top:6px;font-size:13.5px">装完就像个小 App：有自己的图标、全屏打开、断网也能学。</p>' +
+      '<button class="btn" style="margin-top:12px;width:100%" data-act="install-app">立刻装到主屏</button>';
+  } else if (info.supported && info.isIOS) {
+    body =
+      '<ol style="margin:10px 0 0 18px;font-size:13.5px;line-height:1.9"><li>点底部中间那个「分享」按钮</li><li>在列表里往下找「添加到主屏幕」</li><li>点右上角「添加」</li></ol>';
+  } else if (info.supported) {
+    body =
+      '<ol style="margin:10px 0 0 18px;font-size:13.5px;line-height:1.9"><li>点浏览器菜单（右上角三个点或三条线）</li><li>找「安装应用」或「添加到主屏幕」</li><li>确认安装</li></ol>';
+  } else {
+    body =
+      `<p style="margin-top:6px;font-size:13.5px">你现在用的是 <b>${esc(info.name)}</b>，它没把「装成 App」这个能力做进来。</p>` +
+      '<p class="muted" style="margin-top:8px;font-size:13.5px">换成 Chrome、Edge 或 Safari 打开同一个网址，菜单里就会出现「安装应用」。装好之后一样能离线用。</p>' +
+      '<p class="muted" style="margin-top:10px;font-size:12.5px;line-height:1.7">地址可以长按复制：<br><span style="word-break:break-all">zzz07141.github.io/english-coach-app</span></p>';
+  }
+  return `<div class="card" style="border-color:var(--accent)">
+      <h3 style="font-size:15px">装到手机主屏</h3>
+      ${body}
+    </div>`;
+}
+
 function viewSettings() {
   const profile = App.boot.profile;
   const plan = App.boot.plan;
   const aiNotes = (plan && plan.aiNotes) || null;
   const targetLabel = (TARGET_OPTIONS.find((t) => t.id === profile.target) || {}).label || profile.target;
-  const installCard = isStandalone()
-    ? ''
-    : `<div class="card" style="border-color:var(--accent)">
-      <h3 style="font-size:15px">装到手机主屏</h3>
-      <p class="muted" style="margin-top:6px;font-size:13.5px">装完就真的像个小 App：有自己的图标、全屏打开、断网也能学。</p>
-      <ol style="margin:10px 0 0 18px;font-size:13.5px;line-height:1.9">
-        <li>用 Chrome、Edge 或 Safari 打开这个页面</li>
-        <li>点浏览器菜单里的「安装应用」或「添加到主屏幕」</li>
-      </ol>
-      <p class="muted" style="margin-top:10px;font-size:12.5px;line-height:1.7">菜单里要是没有这两项，说明你用的浏览器不支持装 PWA——微信/QQ 里点开的、夸克、UC、火狐、iPhone 上的 Chrome 都属于这类。换成 Chrome 或 Safari 重开一次就有。</p>
-    </div>`;
+  const installCard = installCardHtml();
   return `
     ${installCard}
     <div class="card">
@@ -1306,6 +1356,18 @@ document.addEventListener('click', async (e) => {
       await exportState();
     } else if (act === 'import-state') {
       importState();
+    } else if (act === 'install-app') {
+      const p = deferredPrompt;
+      if (!p) {
+        toast('这个浏览器没提供安装入口，用菜单里的「安装应用」试试');
+      } else {
+        deferredPrompt = null;
+        p.prompt();
+        p.userChoice.then((c) => {
+          if (c && c.outcome === 'accepted') toast('装好了，回到桌面找「英语教练」');
+          render();
+        });
+      }
     }
     /* ---------- 引导 ---------- */
     else if (act === 'ob-start') {
