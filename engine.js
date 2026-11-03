@@ -323,6 +323,17 @@ function pickVocab(level, count) {
     if (out.length >= count) break;
     out.push(byId.get(id));
   }
+  // 新词和到期词都用光了：拿最久没复习的旧词顶上，保证当天词卡数量不缩水
+  if (out.length < count) {
+    const used = new Set(out.filter(Boolean).map((w) => w.id));
+    const rest = Object.keys(state.srs)
+      .filter((id) => byId.has(id) && !used.has(id))
+      .sort((a, b) => String(state.srs[a].due).localeCompare(String(state.srs[b].due)));
+    for (const id of rest) {
+      if (out.length >= count) break;
+      out.push(byId.get(id));
+    }
+  }
   return out.filter(Boolean).slice(0, count);
 }
 
@@ -331,8 +342,10 @@ function pickByRotation(mod, level, count) {
   const pool = content[mod][level] || [];
   if (!pool.length) return [];
   const unread = pool.filter((x) => !learned.has(x.id));
-  const list = unread.length ? unread : pool;
-  return list.slice(0, count);
+  if (unread.length) return unread.slice(0, count);
+  // 全读过了：按日期换个顺序重来一遍，别每次都从第一篇开始
+  const rng = makeRng(seedOf('rot:' + mod + ':' + level + ':' + todayStr()));
+  return shuffleWithRng(pool.slice(), rng).slice(0, count);
 }
 
 function pickListening(level, count, seedKey) {
