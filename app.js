@@ -37,6 +37,8 @@ const App = {
   loading: true,
   error: null,
   shadow: { queue: null, day: null, idx: 0, phase: 'idle', result: null, heard: '', loadPct: 0, loadTip: '' },
+  speakMode: 'shadow',
+  talk: { scene: null, msgs: [], busy: false, phase: 'idle', heard: '', err: '', draft: '', open: false },
 };
 
 // 调试用：控制台里能直接看当前状态
@@ -110,6 +112,8 @@ async function bootstrap() {
       App.onboard = { step: 0, placement: null, answers: [], result: null };
     } else {
       App.completed = rebuildCompleted(App.boot.today, App.boot.pageProgress);
+      restoreView();
+      if (App.view === 'shadow' && App.speakMode === 'talk') talkLoad();
     }
     render();
   } catch (e) {
@@ -126,7 +130,26 @@ async function refreshBoot() {
 }
 
 /* ============================== 渲染入口 ============================== */
+const VIEWS = ['today', 'course', 'shadow', 'progress', 'settings'];
+const VIEW_KEY = 'ec-view';
+
+function saveView() {
+  try {
+    localStorage.setItem(VIEW_KEY, App.view + ':' + App.speakMode);
+  } catch (e) {}
+}
+
+function restoreView() {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY) || '';
+    const [v, m] = raw.split(':');
+    if (VIEWS.indexOf(v) >= 0) App.view = v;
+    if (m === 'talk' || m === 'shadow') App.speakMode = m;
+  } catch (e) {}
+}
+
 function render() {
+  saveView();
   const app = document.getElementById('app');
   if (!app) return;
   if (App.loading) {
@@ -403,8 +426,8 @@ function renderMain(app) {
     title = '学习记录';
     sub = `已经坚持 ${progress.streak || 0} 天`;
   } else if (App.view === 'shadow') {
-    title = '跟读';
-    sub = '说一句，立刻知道哪里没说准';
+    title = App.speakMode === 'talk' ? '对话' : '跟读';
+    sub = App.speakMode === 'talk' ? '我陪你练，说错了当场告诉你' : '说一句，立刻知道哪里没说准';
   } else if (App.view === 'course') {
     title = '课程';
     sub = session
@@ -423,7 +446,7 @@ function renderMain(app) {
     <div class="tabbar"><div class="inner">
       <button class="${App.view === 'today' ? 'on' : ''}" data-act="tab" data-id="today"><span class="ti">🌿</span>今日</button>
       <button class="${App.view === 'course' ? 'on' : ''}" data-act="tab" data-id="course"><span class="ti">🗺️</span>课程</button>
-      <button class="${App.view === 'shadow' ? 'on' : ''}" data-act="tab" data-id="shadow"><span class="ti">🎤</span>跟读</button>
+      <button class="${App.view === 'shadow' ? 'on' : ''}" data-act="tab" data-id="shadow"><span class="ti">💬</span>口语</button>
       <button class="${App.view === 'progress' ? 'on' : ''}" data-act="tab" data-id="progress"><span class="ti">📈</span>记录</button>
       <button class="${App.view === 'settings' ? 'on' : ''}" data-act="tab" data-id="settings"><span class="ti">⚙️</span>设置</button>
     </div></div>`;
@@ -431,7 +454,7 @@ function renderMain(app) {
   const body = document.getElementById('viewBody');
   if (App.view === 'today') body.innerHTML = viewToday();
   else if (App.view === 'course') body.innerHTML = viewCourse();
-  else if (App.view === 'shadow') body.innerHTML = viewShadow();
+  else if (App.view === 'shadow') body.innerHTML = App.speakMode === 'talk' ? viewTalk() : viewShadow();
   else if (App.view === 'progress') body.innerHTML = viewProgress();
   else body.innerHTML = viewSettings();
 }
@@ -796,6 +819,13 @@ function shadowCurrent() {
   return q[Math.min(App.shadow.idx, q.length - 1)] || null;
 }
 
+function speakSwitch() {
+  return `<div class="seg" style="margin-bottom:14px">
+    <button class="${App.speakMode === 'shadow' ? 'on' : ''}" data-act="speak-mode" data-mode="shadow">跟读打分</button>
+    <button class="${App.speakMode === 'talk' ? 'on' : ''}" data-act="speak-mode" data-mode="talk">自由对话</button>
+  </div>`;
+}
+
 function viewShadow() {
   const sh = App.shadow;
   const done = shadowDone();
@@ -805,7 +835,7 @@ function viewShadow() {
   const modelReady = asrOk && window.ASR.ready;
 
   if (!item) {
-    return `<div class="empty"><div class="big">🎧</div><p>这一级暂时没有跟读素材。</p></div>`;
+    return speakSwitch() + `<div class="empty"><div class="big">🎧</div><p>这一级暂时没有跟读素材。</p></div>`;
   }
 
   let body = '';
@@ -862,6 +892,7 @@ function viewShadow() {
   }
 
   return `
+    ${speakSwitch()}
     <div class="shadow-top">
       <div class="shadow-stat"><b>${done.length}</b><span>今天说了</span></div>
       <div class="shadow-stat"><b>${avg === null ? '—' : avg}</b><span>平均分</span></div>
@@ -875,6 +906,281 @@ function viewShadow() {
         return `<div class="slog"><span class="slog-en">${esc((it.en || '').slice(0, 46))}</span><b class="${x.score >= 80 ? 'good' : x.score >= 60 ? 'ok' : 'bad'}">${x.score}</b></div>`;
       }).join('')}</div>
     </div>` : ''}`;
+}
+
+/* ============================== 口语 · 自由对话 ============================== */
+
+const TALK_SCENES = [
+  { id: 'cafe', icon: '☕', name: '咖啡店点单', role: 'a barista at a small coffee shop', goal: '点一杯饮料和一个吃的，问清楚价格和大小', open: "Hi there! What can I get for you today?" },
+  { id: 'directions', icon: '🧭', name: '问路', role: 'a friendly local person on the street', goal: '问去最近的地铁站怎么走，确认要走多久', open: "You look a bit lost — need a hand?" },
+  { id: 'intro', icon: '👋', name: '认识新同事', role: 'a new colleague at your company, it is your first day', goal: '自我介绍，说说你做什么，问对方做什么', open: "Hey! Are you new here? I'm Sam." },
+  { id: 'hotel', icon: '🏨', name: '酒店入住', role: 'a hotel receptionist', goal: '报名字办入住，问早餐时间和 wifi 密码', open: 'Good evening! Checking in?' },
+  { id: 'doctor', icon: '🩺', name: '看医生', role: 'a doctor at a walk-in clinic', goal: '说清楚哪里不舒服、多久了，问要不要吃药', open: "Come in, have a seat. What's going on?" },
+  { id: 'interview', icon: '💼', name: '面试', role: 'an interviewer for a junior role', goal: '介绍自己的经验，回答为什么想来这家公司', open: 'Thanks for coming in. Tell me a bit about yourself.' },
+  { id: 'small', icon: '💬', name: '随便聊', role: 'a friendly English-speaking conversation partner', goal: '聊今天过得怎么样、最近在忙什么', open: "Hey! How's your day going?" },
+];
+
+function talkScene() {
+  return TALK_SCENES.find((s) => s.id === App.talk.scene) || null;
+}
+
+function talkLoad() {
+  const st = Engine.getState();
+  const d = todayStr();
+  const t = st.days[d] && st.days[d].talk;
+  if (t) {
+    App.talk.scene = t.scene || null;
+    App.talk.msgs = Array.isArray(t.msgs) ? t.msgs : [];
+  }
+}
+
+function talkSave() {
+  const st = Engine.getState();
+  const d = todayStr();
+  st.days[d] = st.days[d] || { items: [], minutes: 0, notes: '' };
+  st.days[d].talk = { scene: App.talk.scene, msgs: App.talk.msgs.slice(-40) };
+  Engine.saveState();
+}
+
+function talkNoKey() {
+  const c = Chat.getConfig();
+  const p = Chat.providerInfo(c.provider);
+  return `<div class="card">
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px">先借我一个脑子</div>
+    <p class="muted" style="font-size:14px;line-height:1.6">
+      跟读打分用的是手机本地的语音模型，不要网络。但「自由对话」得有个会说英语的脑子接你的话，
+      这个只能在云端跑——所以要一把你自己的 API key。key 只存在这台设备里，不上传到我这边，也不进仓库。
+    </p>
+    <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+      <a class="btn" href="${esc(Chat.providerInfo(Chat.getConfig().provider).keyUrl)}" target="_blank" rel="noopener">去 ${esc(p.name)} 拿一把 key</a>
+      <button class="btn ghost" data-act="tab" data-id="settings">填好之后去设置页贴上</button>
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:12px">现在支持：${Object.values(Chat.PROVIDERS).map((x) => esc(x.name)).join(' / ')}</p>
+  </div>`;
+}
+
+function talkPicker() {
+  const t = App.talk;
+  return `<div class="card">
+    <div class="seg-title">挑一个场景</div>
+    <div class="talk-grid">
+      ${TALK_SCENES.map((s) => `<button class="talk-scene" data-act="talk-scene" data-id="${s.id}">
+        <span class="ts-i">${s.icon}</span><span class="ts-n">${esc(s.name)}</span>
+      </button>`).join('')}
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:14px">进去之后你说英语，我按这个场景的角色回你——说错了我会当场点出来。</p>
+  </div>
+  ${t.msgs.length ? `<div class="card" style="margin-top:14px">
+    <div class="seg-title">接着上次的</div>
+    <div class="muted" style="font-size:14px">今天已经聊了 ${t.msgs.filter((m) => m.role === 'me').length} 句</div>
+    <button class="btn ghost" style="margin-top:10px" data-act="talk-resume">接着聊</button>
+  </div>` : ''}`;
+}
+
+function talkBubbles() {
+  const t = App.talk;
+  if (!t.msgs.length) {
+    const s = talkScene();
+    return `<div class="talk-empty">
+      <div class="te-line">${esc(s ? s.goal : '')}</div>
+      <div class="muted" style="font-size:13px;margin-top:8px">点下面的麦克风说一句，或者直接打英文发出去。</div>
+    </div>`;
+  }
+  return t.msgs.map((m) => {
+    if (m.role === 'me') return `<div class="bubble me"><div class="b-text">${esc(m.text)}</div></div>`;
+    if (m.role === 'sys') return `<div class="bubble sys">${esc(m.text)}</div>`;
+    return `<div class="bubble ai">
+      <div class="b-text">${esc(m.text)}</div>
+      ${m.fix ? `<div class="b-fix">✏️ ${esc(m.fix)}</div>` : ''}
+      ${m.hint ? `<div class="b-hint">💡 ${esc(m.hint)}</div>` : ''}
+      <button class="b-say" data-act="talk-say" data-i="${t.msgs.indexOf(m)}">🔊 再听一遍</button>
+    </div>`;
+  }).join('');
+}
+
+function viewTalk() {
+  const t = App.talk;
+  if (!Chat.hasKey()) return speakSwitch() + talkNoKey();
+  const s = talkScene();
+  if (!s) return speakSwitch() + talkPicker();
+
+  const busy = t.busy || t.phase === 'loading' || t.phase === 'recording' || t.phase === 'scoring';
+  let footer = '';
+  if (t.phase === 'loading') {
+    footer = `<div class="talk-status"><div class="spin"></div>
+      <div class="muted" style="font-size:13px">第一次用要加载语音模型，大概 42MB</div>
+      <div class="bar" style="width:100%;margin-top:8px"><i id="loadBar" style="width:0%"></i></div>
+      <div class="muted" id="loadTip" style="font-size:12px;margin-top:6px">正在准备…</div></div>`;
+  } else if (t.phase === 'recording') {
+    footer = `<div class="talk-status"><div class="rec-dot"></div>
+      <div style="font-size:14px">在听了，说完停一下就好</div>
+      <div class="muted" id="recTip" style="font-size:13px">正在听… 0.0 秒</div></div>`;
+  } else if (t.phase === 'scoring') {
+    footer = `<div class="talk-status"><div class="spin"></div><div class="muted" style="font-size:13px">听一下你说了什么…</div></div>`;
+  } else if (t.busy) {
+    footer = `<div class="talk-status"><div class="spin"></div><div class="muted" style="font-size:13px">我在想怎么回你…</div></div>`;
+  } else {
+    footer = `<div class="talk-input">
+      <button class="btn mic" data-act="talk-record">🎤</button>
+      <input id="talkInput" placeholder="或者打一句英文…" value="${esc(t.draft || '')}" />
+      <button class="btn" data-act="talk-send">发</button>
+    </div>`;
+  }
+
+  return `${speakSwitch()}
+    <div class="talk-head">
+      <div><b>${s.icon} ${esc(s.name)}</b></div>
+      <div class="muted" style="font-size:13px">${esc(s.goal)}</div>
+      <button class="mini" data-act="talk-exit">换场景</button>
+    </div>
+    <div class="talk-body" id="talkBody">${talkBubbles()}</div>
+    ${t.heard ? `<div class="talk-heard">听到的是：${esc(t.heard)}</div>` : ''}
+    <div class="talk-pad"></div>
+    ${footer}`;
+}
+
+function scrollTalkBottom() {
+  const el = document.getElementById('talkBody');
+  if (el) el.scrollTop = el.scrollHeight;
+  if (App.view === 'shadow' && App.speakMode === 'talk') {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  }
+}
+
+async function talkSend(text) {
+  text = String(text || '').trim();
+  if (!text) return;
+  const t = App.talk;
+  if (t.busy || !t.scene) return;
+  const s = talkScene();
+  if (!s) return;
+
+  t.msgs.push({ role: 'me', text, ts: Date.now() });
+  t.busy = true;
+  t.err = '';
+  t.draft = '';
+  t.heard = '';
+  render();
+  scrollTalkBottom();
+
+  try {
+    const profile = (App.boot && App.boot.profile) || {};
+    const level = profile.level || 'A1';
+    const sys = [
+      'You are ' + s.role + '.',
+      'You are talking with a Chinese learner of English, CEFR level ' + level + '.',
+      'Their goal in this scene: ' + s.goal + '.',
+      '',
+      'Rules:',
+      '- Reply in English only, 1-2 short natural spoken sentences. Stay in character, do not explain the scene.',
+      '- Keep it going: usually end with a simple question back to them.',
+      '- "fix": if their last sentence has a real error (grammar, wrong word, unnatural phrasing), point it out in Chinese, short, with the corrected English. If it is fine, use "".',
+      '- "hint": a short Chinese hint for what they could say next. Keep it optional and light.',
+      '',
+      'Return STRICT JSON only, no markdown:',
+      '{"reply":"...","hint":"...","fix":"..."}',
+    ].join('\n');
+
+    const msgs = [{ role: 'system', content: sys }];
+    const hist = t.msgs.slice(0, -1).slice(-8);
+    for (const m of hist) {
+      if (m.role === 'me') msgs.push({ role: 'user', content: m.text });
+      else if (m.role === 'ai') msgs.push({ role: 'assistant', content: JSON.stringify({ reply: m.text, hint: '', fix: '' }) });
+    }
+    msgs.push({ role: 'user', content: text });
+
+    const raw = await Chat.ask(msgs, { json: true, maxTokens: 320, temperature: 0.8 });
+    const j = Chat.parseJson(raw) || { reply: raw, hint: '', fix: '' };
+    const reply = String(j.reply || '').trim() || raw;
+
+    t.msgs.push({
+      role: 'ai',
+      text: reply,
+      hint: String(j.hint || '').trim(),
+      fix: String(j.fix || '').trim(),
+      ts: Date.now(),
+    });
+    talkSave();
+    speak(reply);
+  } catch (e) {
+    const msg = Chat.describe(e);
+    t.err = msg;
+    t.msgs.push({ role: 'sys', text: msg, ts: Date.now() });
+  } finally {
+    t.busy = false;
+    render();
+    scrollTalkBottom();
+  }
+}
+
+async function talkRecord() {
+  const t = App.talk;
+  if (t.busy || t.phase !== 'idle') return;
+  if (!window.ASR) { toast('语音模块没加载上，刷新一下再试'); return; }
+  if (!ASR.hasMic()) { toast('这个浏览器拿不到麦克风，打字也行'); return; }
+
+  if (!ASR.ready) {
+    t.phase = 'loading';
+    t.busy = true;
+    render();
+    try {
+      await ASR.load((p) => {
+        const bar = document.getElementById('loadBar');
+        const tip = document.getElementById('loadTip');
+        if (!p || !p.file) return;
+        let pct = 0;
+        if (p.status === 'progress' && typeof p.progress === 'number') pct = p.progress;
+        if (bar) bar.style.width = pct + '%';
+        if (tip) tip.textContent = p.file + ' ' + Math.round(pct) + '%';
+      });
+    } catch (e) {
+      t.phase = 'idle';
+      t.busy = false;
+      render();
+      toast('语音模型没加载上：' + (e && e.message ? e.message : e));
+      return;
+    }
+    t.busy = false;
+  }
+
+  t.phase = 'recording';
+  render();
+
+  let secs = 0;
+  const ticker = setInterval(() => {
+    secs += 0.2;
+    const el = document.getElementById('recTip');
+    if (el) el.textContent = '正在听… ' + secs.toFixed(1) + ' 秒';
+  }, 200);
+
+  try {
+    const rec = await ASR.record({ maxMs: 15000 });
+    clearInterval(ticker);
+    if (!rec || !rec.ok) {
+      t.phase = 'idle';
+      render();
+      toast(rec && rec.reason === 'nospeech' ? '没听到声音，再说一次？' : '这次没录上');
+      return;
+    }
+    t.phase = 'scoring';
+    render();
+    const out = await ASR.transcribe(rec.samples);
+    const text = String((out && out.text) || '').trim();
+    t.phase = 'idle';
+    if (!text) {
+      render();
+      toast('这句没听清，再试一次');
+      return;
+    }
+    t.heard = text;
+    render();
+    await talkSend(text);
+  } catch (e) {
+    clearInterval(ticker);
+    t.phase = 'idle';
+    render();
+    toast('录音出错了：' + (e && e.message ? e.message : e));
+  }
 }
 
 async function shadowRecord() {
@@ -975,6 +1281,36 @@ function shadowNext() {
   window.scrollTo(0, 0);
 }
 
+function aiCardHtml() {
+  const c = Chat.getConfig();
+  const p = Chat.providerInfo(c.provider);
+  const ok = !!c.key;
+  return `<div class="card">
+      <h3 style="font-size:15px">自由对话用的 AI</h3>
+      <p class="muted" style="font-size:13.5px;margin-top:6px;line-height:1.65">
+        ${
+          ok
+            ? `现在用的是 <b>${esc(p.name)}</b>，模型 <code>${esc(c.model || p.model)}</code>。key 只在这台设备里，不上传。`
+            : '跟读打分不用联网，但「自由对话」得有个会说英语的脑子接你的话。填一把你自己的 key 就能用。'
+        }
+      </p>
+      <div class="chips" style="margin-top:12px">
+        ${Object.entries(Chat.PROVIDERS)
+          .map(([id, x]) => `<button class="chip ${id === c.provider ? 'on' : ''}" data-act="ai-provider" data-id="${id}">${esc(x.name)}</button>`)
+          .join('')}
+      </div>
+      <input id="aiKey" type="password" class="txt" autocomplete="off" style="margin-top:12px" placeholder="${ok ? '已经填好了，想换就贴新的' : '粘贴你的 API key'}" />
+      <input id="aiModel" class="txt" autocomplete="off" style="margin-top:8px" placeholder="模型名（留空用 ${esc(p.model)}）" value="${esc(c.model || '')}" />
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn sm" style="flex:1" data-act="ai-save">保存</button>
+        <button class="btn sm ghost" style="flex:1" data-act="ai-test">测一下</button>
+      </div>
+      <p class="muted" style="font-size:12.5px;margin-top:10px;line-height:1.6">
+        哪拿 key：<a href="${esc(p.keyUrl)}" target="_blank" rel="noopener">${esc(p.keyUrl)}</a><br />${esc(p.note)}
+      </p>
+    </div>`;
+}
+
 function viewSettings() {
   const profile = App.boot.profile;
   const plan = App.boot.plan;
@@ -1011,6 +1347,7 @@ function viewSettings() {
       </div>
       <button class="btn sm" style="margin-top:14px" data-act="apply-plan">按新设置重排计划</button>
     </div>
+    ${aiCardHtml()}
     <div class="card">
       <h3 style="font-size:15px">AI 老师的意见</h3>
       ${
@@ -1661,6 +1998,67 @@ document.addEventListener('click', async (e) => {
       render();
     } else if (act === 'shadow-next') {
       shadowNext();
+    } else if (act === 'speak-mode') {
+      App.speakMode = t.dataset.mode === 'talk' ? 'talk' : 'shadow';
+      if (App.speakMode === 'talk') talkLoad();
+      render();
+      if (App.speakMode === 'talk') scrollTalkBottom();
+    } else if (act === 'talk-scene') {
+      App.talk.scene = t.dataset.id;
+      App.talk.msgs = [];
+      App.talk.heard = '';
+      App.talk.err = '';
+      const sc = TALK_SCENES.find((x) => x.id === App.talk.scene);
+      if (sc) {
+        App.talk.msgs.push({ role: 'ai', text: sc.open, hint: '', fix: '', ts: Date.now() });
+        speak(sc.open);
+      }
+      talkSave();
+      render();
+      scrollTalkBottom();
+    } else if (act === 'ai-provider') {
+      const cur = Chat.getConfig();
+      Chat.setConfig({ provider: t.dataset.id, key: cur.key, model: '' });
+      render();
+    } else if (act === 'ai-save') {
+      const cur = Chat.getConfig();
+      const k = ((document.getElementById('aiKey') || {}).value || '').trim();
+      const m = ((document.getElementById('aiModel') || {}).value || '').trim();
+      Chat.setConfig({ provider: cur.provider, key: k || cur.key, model: m });
+      render();
+      toast(Chat.hasKey() ? '存好了，去口语页挑个场景试试' : '还没填 key');
+    } else if (act === 'ai-test') {
+      const cur = Chat.getConfig();
+      const k = ((document.getElementById('aiKey') || {}).value || '').trim();
+      const m = ((document.getElementById('aiModel') || {}).value || '').trim();
+      if (k || m) Chat.setConfig({ provider: cur.provider, key: k || cur.key, model: m });
+      if (!Chat.hasKey()) { toast('先填一把 key'); return; }
+      toast('正在问它一句话…');
+      try {
+        const out = await Chat.ask([{ role: 'user', content: 'Reply with exactly: ok' }], { maxTokens: 8, timeoutMs: 20000 });
+        toast('通了：' + String(out).slice(0, 40));
+      } catch (e) {
+        toast('没通：' + Chat.describe(e));
+      }
+    } else if (act === 'talk-exit') {
+      talkSave();
+      App.talk.scene = null;
+      App.talk.msgs = [];
+      App.talk.heard = '';
+      render();
+    } else if (act === 'talk-resume') {
+      talkLoad();
+      render();
+      scrollTalkBottom();
+    } else if (act === 'talk-record') {
+      await talkRecord();
+    } else if (act === 'talk-send') {
+      const inp = document.getElementById('talkInput');
+      const val = (inp && inp.value) || App.talk.draft || '';
+      await talkSend(val);
+    } else if (act === 'talk-say') {
+      const m = App.talk.msgs[Number(t.dataset.i)];
+      if (m && m.role === 'ai') speak(m.text);
     } else if (act === 'close-modal') {
       closeModal();
     } else if (act === 'gloss') {
@@ -1806,6 +2204,16 @@ document.addEventListener('input', (e) => {
   } else if (t.dataset.input === 'check') {
     const ci = Number(t.dataset.ci);
     if (App.modal) App.modal.state.checks[ci] = t.checked;
+  } else if (t.id === 'talkInput') {
+    App.talk.draft = t.value;
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.target && e.target.id === 'talkInput' && e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const el = e.target;
+    talkSend(el.value);
   }
 });
 
