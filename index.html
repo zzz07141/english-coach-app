@@ -15,16 +15,17 @@
     <link rel="manifest" href="manifest.webmanifest" />
     <link rel="icon" href="icons/icon-192.png" sizes="192x192" />
     <link rel="apple-touch-icon" href="icons/icon-192.png" />
-    <link rel="stylesheet" href="styles.css?v=12" />
+    <link rel="stylesheet" href="styles.css?v=15" />
   </head>
   <body>
     <div id="app"></div>
     <div id="toast" class="toast" aria-live="polite"></div>
 
-    <script defer src="content.js?v=12"></script>
-    <script defer src="engine.js?v=12"></script>
-    <script defer src="asr.js?v=12"></script>
-    <script type="module" src="app.js?v=12"></script>
+    <script defer src="content.js?v=15"></script>
+    <script defer src="engine.js?v=15"></script>
+    <script defer src="asr.js?v=15"></script>
+    <script defer src="chat.js?v=15"></script>
+    <script type="module" src="app.js?v=15"></script>
     <script>
       // 装到主屏后要能离线打开，靠这个 Service Worker
       if ('serviceWorker' in navigator) {
