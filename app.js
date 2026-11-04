@@ -36,7 +36,11 @@ const App = {
   completed: new Set(),
   loading: true,
   error: null,
+  shadow: { queue: null, day: null, idx: 0, phase: 'idle', result: null, heard: '', loadPct: 0, loadTip: '' },
 };
+
+// 调试用：控制台里能直接看当前状态
+window.EnglishCoach = App;
 
 /* ============================== 基础工具 ============================== */
 const $ = (s, r = document) => r.querySelector(s);
@@ -398,6 +402,9 @@ function renderMain(app) {
   } else if (App.view === 'progress') {
     title = '学习记录';
     sub = `已经坚持 ${progress.streak || 0} 天`;
+  } else if (App.view === 'shadow') {
+    title = '跟读';
+    sub = '说一句，立刻知道哪里没说准';
   } else {
     title = '设置';
     sub = `${LEVEL_LABEL[profile.level]} · 每天 ${profile.dailyMinutes} 分钟`;
@@ -410,12 +417,14 @@ function renderMain(app) {
     </div>
     <div class="tabbar"><div class="inner">
       <button class="${App.view === 'today' ? 'on' : ''}" data-act="tab" data-id="today"><span class="ti">🌿</span>今日</button>
+      <button class="${App.view === 'shadow' ? 'on' : ''}" data-act="tab" data-id="shadow"><span class="ti">🎤</span>跟读</button>
       <button class="${App.view === 'progress' ? 'on' : ''}" data-act="tab" data-id="progress"><span class="ti">📈</span>记录</button>
       <button class="${App.view === 'settings' ? 'on' : ''}" data-act="tab" data-id="settings"><span class="ti">⚙️</span>设置</button>
     </div></div>`;
 
   const body = document.getElementById('viewBody');
   if (App.view === 'today') body.innerHTML = viewToday();
+  else if (App.view === 'shadow') body.innerHTML = viewShadow();
   else if (App.view === 'progress') body.innerHTML = viewProgress();
   else body.innerHTML = viewSettings();
 }
@@ -648,6 +657,238 @@ function installCardHtml() {
       <h3 style="font-size:15px">装到手机主屏</h3>
       ${body}
     </div>`;
+}
+
+/* ============================== 跟读打分 ============================== */
+function seedRng(str) {
+  let a = 0;
+  for (let i = 0; i < String(str).length; i++) a = (a * 31 + String(str).charCodeAt(i)) >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shadowPool() {
+  const C = window.CONTENT || {};
+  const lv = String((App.boot.profile && App.boot.profile.level) || 'A1').toLowerCase();
+  const key = Object.keys(C).find((k) => k === `listening.${lv}.json`) || Object.keys(C).find((k) => k.indexOf('listening.') === 0);
+  const items = (key && C[key] && C[key].items) || [];
+  return items.filter((it) => it && it.en);
+}
+
+function shadowDone() {
+  const st = window.Engine.getState();
+  const d = todayStr();
+  st.days[d] = st.days[d] || {};
+  st.days[d].shadowing = st.days[d].shadowing || [];
+  return st.days[d].shadowing;
+}
+
+function shadowQueue() {
+  if (App.shadow.queue && App.shadow.day === todayStr()) return App.shadow.queue;
+  const pool = shadowPool();
+  const doneIds = new Set(shadowDone().map((x) => x.id));
+  const fresh = pool.filter((it) => !doneIds.has(it.id));
+  const src = fresh.length >= 6 ? fresh : pool;
+  const rng = seedRng('shadow:' + todayStr());
+  const arr = src.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i];
+    arr[i] = arr[j];
+    arr[j] = t;
+  }
+  App.shadow.queue = arr.slice(0, 6);
+  App.shadow.day = todayStr();
+  return App.shadow.queue;
+}
+
+function shadowCurrent() {
+  const q = shadowQueue();
+  return q[Math.min(App.shadow.idx, q.length - 1)] || null;
+}
+
+function viewShadow() {
+  const sh = App.shadow;
+  const done = shadowDone();
+  const avg = done.length ? Math.round(done.reduce((n, x) => n + x.score, 0) / done.length) : null;
+  const item = shadowCurrent();
+  const asrOk = !!window.ASR;
+  const modelReady = asrOk && window.ASR.ready;
+
+  if (!item) {
+    return `<div class="empty"><div class="big">🎧</div><p>这一级暂时没有跟读素材。</p></div>`;
+  }
+
+  let body = '';
+  if (sh.phase === 'loading') {
+    body = `
+      <div class="shadow-center">
+        <div class="spin"></div>
+        <div class="shadow-hint">第一次用要加载语音模型，大概 42MB，之后就不用再下了。</div>
+        <div class="bar"><i id="loadBar" style="width:${sh.loadPct || 0}%"></i></div>
+        <div class="muted" id="loadTip" style="font-size:13px;margin-top:8px">${esc(sh.loadTip || '正在准备…')}</div>
+      </div>`;
+  } else if (sh.phase === 'recording') {
+    body = `
+      <div class="shadow-center">
+        <div class="rec-dot"></div>
+        <div class="shadow-hint">在录了，读完停一下就好</div>
+        <div class="levelmeter"><i id="lvl" style="width:6%"></i></div>
+        <div class="muted" id="recTip" style="font-size:13px;margin-top:8px">0.0 秒</div>
+      </div>`;
+  } else if (sh.phase === 'scoring') {
+    body = `
+      <div class="shadow-center">
+        <div class="spin"></div>
+        <div class="shadow-hint">听一下你说了什么…</div>
+      </div>`;
+  } else if (sh.phase === 'result' && sh.result) {
+    const r = sh.result;
+    body = `
+      <div class="score-box ${r.tone}">
+        <div class="score-num">${r.score}</div>
+        <div class="score-label">${esc(r.label)}</div>
+        <div class="score-sub">说中 ${r.matched}/${r.total} 个词${r.extra ? ` · 多了 ${r.extra}` : ''}</div>
+      </div>
+      <div class="wordchips">
+        ${r.words.map((w) => `<span class="wchip ${w.ok ? 'ok' : 'miss'}">${esc(w.w)}</span>`).join('')}
+      </div>
+      ${sh.heard ? `<div class="heard">听到的是：<span>${esc(sh.heard)}</span></div>` : ''}
+      <div class="shadow-actions">
+        <button class="btn ghost" data-act="shadow-again">再说一次</button>
+        <button class="btn" data-act="shadow-next">下一句</button>
+      </div>`;
+  } else {
+    body = `
+      <div class="shadow-sentence">
+        <div class="en">${esc(item.en)}</div>
+        <div class="zh">${esc(item.zh || '')}</div>
+      </div>
+      <div class="shadow-actions col">
+        <button class="btn ghost" data-act="shadow-play">🔊 听一遍示范</button>
+        <button class="btn ghost" data-act="shadow-play-slow">🐢 慢速再听</button>
+        <button class="btn mic" data-act="shadow-record">🎤 按住说一次</button>
+      </div>
+      ${modelReady ? '' : `<div class="muted" style="font-size:13px;margin-top:10px;text-align:center">第一次点会下载 42MB 的语音模型</div>`}`;
+  }
+
+  return `
+    <div class="shadow-top">
+      <div class="shadow-stat"><b>${done.length}</b><span>今天说了</span></div>
+      <div class="shadow-stat"><b>${avg === null ? '—' : avg}</b><span>平均分</span></div>
+      <div class="shadow-stat"><b>${Math.min(sh.idx + 1, (sh.queue || []).length || 1)}/${(sh.queue || []).length || 1}</b><span>这一轮</span></div>
+    </div>
+    <div class="card shadow-card">${body}</div>
+    ${done.length ? `<div class="card" style="margin-top:14px">
+      <h3 style="font-size:15px">今天说过的</h3>
+      <div class="shadow-log">${done.slice(-8).reverse().map((x) => {
+        const it = shadowPool().find((p) => p.id === x.id) || {};
+        return `<div class="slog"><span class="slog-en">${esc((it.en || '').slice(0, 46))}</span><b class="${x.score >= 80 ? 'good' : x.score >= 60 ? 'ok' : 'bad'}">${x.score}</b></div>`;
+      }).join('')}</div>
+    </div>` : ''}`;
+}
+
+async function shadowRecord() {
+  if (!window.ASR) { toast('语音模块没加载上，刷新一下再试'); return; }
+  if (!ASR.hasMic()) { toast('这个浏览器拿不到麦克风'); return; }
+  const item = shadowCurrent();
+  if (!item) return;
+
+  if (!ASR.ready) {
+    App.shadow.phase = 'loading';
+    App.shadow.loadPct = 0;
+    App.shadow.loadTip = '正在加载语音模型…';
+    render();
+    try {
+      await ASR.load((p) => {
+        const bar = document.getElementById('loadBar');
+        const tip = document.getElementById('loadTip');
+        if (!p || !p.file) return;
+        let pct = App.shadow.loadPct || 0;
+        if (p.status === 'progress' && typeof p.progress === 'number') pct = Math.max(pct, p.progress);
+        if (p.status === 'done') pct = Math.max(pct, 0);
+        App.shadow.loadPct = pct;
+        App.shadow.loadTip = p.file + ' ' + Math.round(pct) + '%';
+        if (bar) bar.style.width = pct + '%';
+        if (tip) tip.textContent = App.shadow.loadTip;
+      });
+    } catch (e) {
+      App.shadow.phase = 'idle';
+      render();
+      toast('模型没加载起来：' + ((e && e.message) || '未知错误'));
+      return;
+    }
+  }
+
+  App.shadow.phase = 'recording';
+  render();
+  window.scrollTo(0, 0);
+  let rec;
+  const startedAt = Date.now();
+  const tick = setInterval(() => {
+    const tip = document.getElementById('recTip');
+    if (tip) tip.textContent = '正在录… ' + ((Date.now() - startedAt) / 1000).toFixed(1) + ' 秒';
+  }, 200);
+  try {
+    rec = await ASR.record({
+      maxMs: 20000,
+      onLevel: (rms) => {
+        const el = document.getElementById('lvl');
+        if (el) el.style.width = Math.min(100, Math.max(4, rms * 700)) + '%';
+      },
+    });
+  } catch (e) {
+    clearInterval(tick);
+    App.shadow.phase = 'idle';
+    render();
+    toast('录音没开始：' + ((e && e.message) || '检查一下麦克风权限'));
+    return;
+  }
+  clearInterval(tick);
+
+  if (!rec.spoke) {
+    App.shadow.phase = 'idle';
+    render();
+    toast('没听清，靠近一点再说一次');
+    return;
+  }
+
+  App.shadow.phase = 'scoring';
+  render();
+  try {
+    const out = await ASR.transcribe(rec.audio);
+    const result = ASR.scoreReading(item.en, out.text);
+    const list = shadowDone();
+    list.push({ id: item.id, score: result.score, ts: Date.now(), heard: out.text, seconds: rec.seconds });
+    window.Engine.saveState();
+    App.shadow.result = result;
+    App.shadow.heard = out.text;
+    App.shadow.phase = 'result';
+  } catch (e) {
+    App.shadow.phase = 'idle';
+    toast('识别没成功：' + ((e && e.message) || '再试一次'));
+  }
+  render();
+}
+
+function shadowNext() {
+  const q = shadowQueue();
+  App.shadow.idx = Math.min(App.shadow.idx + 1, q.length - 1);
+  if (App.shadow.idx === q.length - 1 && q.length > 1) {
+    App.shadow.idx = 0;
+    App.shadow.queue = null;
+    shadowQueue();
+  }
+  App.shadow.phase = 'idle';
+  App.shadow.result = null;
+  App.shadow.heard = '';
+  render();
+  window.scrollTo(0, 0);
 }
 
 function viewSettings() {
@@ -1086,7 +1327,7 @@ function renderListeningModal(host, m) {
   );
 }
 
-function speak(text) {
+function speak(text, rate) {
   if (!('speechSynthesis' in window)) {
     toast('这个浏览器不支持朗读');
     return;
@@ -1094,7 +1335,7 @@ function speak(text) {
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'en-US';
-  u.rate = 0.88;
+  u.rate = rate || 0.88;
   const vs = window.speechSynthesis.getVoices() || [];
   const en = vs.find((v) => /^en[-_](US|GB)/i.test(v.lang)) || vs.find((v) => /^en/i.test(v.lang));
   if (en) u.voice = en;
@@ -1305,6 +1546,21 @@ document.addEventListener('click', async (e) => {
       window.scrollTo({ top: 0 });
     } else if (act === 'open-task') {
       openTask(Number(t.dataset.idx));
+    } else if (act === 'shadow-record') {
+      await shadowRecord();
+    } else if (act === 'shadow-play') {
+      const sit = shadowCurrent();
+      if (sit) speak(sit.en);
+    } else if (act === 'shadow-play-slow') {
+      const sit2 = shadowCurrent();
+      if (sit2) speak(sit2.en, 0.6);
+    } else if (act === 'shadow-again') {
+      App.shadow.phase = 'idle';
+      App.shadow.result = null;
+      App.shadow.heard = '';
+      render();
+    } else if (act === 'shadow-next') {
+      shadowNext();
     } else if (act === 'close-modal') {
       closeModal();
     } else if (act === 'gloss') {
