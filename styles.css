@@ -1527,3 +1527,33 @@ p {
   .slog b.ok { color: #e0ae6a; }
   .slog b.bad { color: #f0a19c; }
 }
+
+/* ============================== 课程路径 ============================== */
+.course-hero{background:linear-gradient(135deg,#2f6b5e,#3d8577);color:#fff;border-radius:18px;padding:20px;display:flex;flex-direction:column}
+.ch-level{font-size:12px;opacity:.82;letter-spacing:.04em}
+.ch-no{font-size:30px;font-weight:700;margin-top:8px;letter-spacing:-.01em}
+.ch-name{font-size:15px;opacity:.92;margin-top:4px}
+.ch-bar{height:6px;background:rgba(255,255,255,.22);border-radius:3px;margin-top:14px;overflow:hidden}
+.ch-bar i{display:block;height:100%;background:#f0c48a;border-radius:3px;transition:width .4s ease}
+.ch-meta{font-size:12px;opacity:.85;margin-top:8px}
+.course-hero .btn{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.32)}
+.course-list{margin-top:18px;display:flex;flex-direction:column;gap:10px}
+.unit{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px}
+.unit.cur{border-color:var(--brand);box-shadow:0 0 0 1px var(--brand) inset}
+.unit.lock{opacity:.62}
+.unit-head{display:flex;align-items:baseline;gap:8px}
+.unit-no{font-size:12px;color:var(--ink-2)}
+.unit-name{font-size:14px;font-weight:600;flex:1}
+.unit-count{font-size:12px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.unit-dots{display:flex;gap:7px;margin-top:12px}
+.dot{width:32px;height:32px;border-radius:50%;border:1.5px solid var(--line);background:transparent;color:var(--ink-2);font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:transform .12s ease;padding:0}
+.dot:active{transform:scale(.94)}
+.dot.done{background:var(--brand);border-color:var(--brand);color:#fff}
+.dot.now{border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 3px rgba(201,118,42,.18);animation:dotPulse 2s infinite}
+.dot.review{border-style:dashed}
+.dot.review.done{border-style:solid}
+@keyframes dotPulse{0%,100%{box-shadow:0 0 0 3px rgba(201,118,42,.16)}50%{box-shadow:0 0 0 7px rgba(201,118,42,.05)}}
+@media (prefers-color-scheme: dark){
+  .course-hero{background:linear-gradient(135deg,#1f4a41,#2a6157)}
+  .dot.now{box-shadow:0 0 0 3px rgba(217,146,72,.22)}
+}
