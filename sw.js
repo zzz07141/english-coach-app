@@ -1,13 +1,16 @@
 /* 英语教练 · 离线缓存
-   缓存优先、后台更新：装到主屏以后，断网也能打开，学的东西都还在。 */
-const CACHE = 'english-coach-v6';
+   缓存优先、后台更新：装到主屏以后，断网也能打开，学的东西都还在。
+   语音模型（whisper-tiny.en）单独一个缓存桶：第一次下载完就留在手机里。 */
+const CACHE = 'english-coach-v11';
+const MODEL_CACHE = 'english-coach-asr-v1';
 const ASSETS = [
   './',
   './index.html',
-  './styles.css?v=6',
-  './content.js?v=6',
-  './engine.js?v=6',
-  './app.js?v=6',
+  './styles.css?v=11',
+  './content.js?v=11',
+  './engine.js?v=11',
+  './asr.js?v=11',
+  './app.js?v=11',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -28,7 +31,9 @@ self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) =>
+        Promise.all(keys.filter((k) => k !== CACHE && k !== MODEL_CACHE).map((k) => caches.delete(k)))
+      )
       .then(() => self.clients.claim())
   );
 });
@@ -46,7 +51,24 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // 静态资源：先用缓存，同时后台更新，下次打开就是新的
+  // 语音模型：下过一次就永远用本地那份
+  if (url.pathname.indexOf('/whisper-tiny.en/') >= 0) {
+    e.respondWith(
+      caches.match(req).then((cached) => {
+        if (cached) return cached;
+        return fetch(req).then((res) => {
+          if (res && res.ok) {
+            const copy = res.clone();
+            caches.open(MODEL_CACHE).then((c) => c.put(req, copy)).catch(() => {});
+          }
+          return res;
+        });
+      })
+    );
+    return;
+  }
+
+  // 其它静态资源：先用缓存，同时后台更新，下次打开就是新的
   e.respondWith(
     caches.match(req).then((cached) => {
       const network = fetch(req)
