@@ -397,7 +397,7 @@ function renderMain(app) {
   if (App.view === 'today') {
     const d = todayStr();
     sub = session
-      ? `第 ${session.week} 周 第 ${session.dayOfWeek} 天 · ${session.phaseName}${session.theme ? ` · ${session.theme}` : ''}`
+      ? `第 ${lessonNo(session.week, session.dayOfWeek)} 课 · ${session.phaseName}${session.theme ? ` · ${session.theme}` : ''}`
       : `${d} 周${weekdayCN(d)}`;
   } else if (App.view === 'progress') {
     title = '学习记录';
@@ -405,6 +405,11 @@ function renderMain(app) {
   } else if (App.view === 'shadow') {
     title = '跟读';
     sub = '说一句，立刻知道哪里没说准';
+  } else if (App.view === 'course') {
+    title = '课程';
+    sub = session
+      ? `第 ${lessonNo(session.week, session.dayOfWeek)} 课 · ${session.theme || ''}`
+      : '一条路走到 B2';
   } else {
     title = '设置';
     sub = `${LEVEL_LABEL[profile.level]} · 每天 ${profile.dailyMinutes} 分钟`;
@@ -417,6 +422,7 @@ function renderMain(app) {
     </div>
     <div class="tabbar"><div class="inner">
       <button class="${App.view === 'today' ? 'on' : ''}" data-act="tab" data-id="today"><span class="ti">🌿</span>今日</button>
+      <button class="${App.view === 'course' ? 'on' : ''}" data-act="tab" data-id="course"><span class="ti">🗺️</span>课程</button>
       <button class="${App.view === 'shadow' ? 'on' : ''}" data-act="tab" data-id="shadow"><span class="ti">🎤</span>跟读</button>
       <button class="${App.view === 'progress' ? 'on' : ''}" data-act="tab" data-id="progress"><span class="ti">📈</span>记录</button>
       <button class="${App.view === 'settings' ? 'on' : ''}" data-act="tab" data-id="settings"><span class="ti">⚙️</span>设置</button>
@@ -424,9 +430,87 @@ function renderMain(app) {
 
   const body = document.getElementById('viewBody');
   if (App.view === 'today') body.innerHTML = viewToday();
+  else if (App.view === 'course') body.innerHTML = viewCourse();
   else if (App.view === 'shadow') body.innerHTML = viewShadow();
   else if (App.view === 'progress') body.innerHTML = viewProgress();
   else body.innerHTML = viewSettings();
+}
+
+/* ============================== 课程路径 ============================== */
+
+function lessonNo(week, day) {
+  return (week - 1) * 7 + day;
+}
+
+function courseMap() {
+  const map = {};
+  (App.boot.history || []).forEach((h) => {
+    if (!h.week || !h.dayOfWeek) return;
+    const k = `${h.week}-${h.dayOfWeek}`;
+    const prev = map[k];
+    if (!prev || (h.minutes || 0) > (prev.minutes || 0)) {
+      map[k] = { minutes: h.minutes || 0, date: h.date, notes: h.notes || '' };
+    }
+  });
+  return map;
+}
+
+function viewCourse() {
+  const plan = App.boot.plan;
+  const session = App.boot.today;
+  if (!plan) {
+    return `<div class="empty"><div class="big">🗺️</div><p>还没有课程。</p></div>`;
+  }
+  const map = courseMap();
+  const totalLessons = plan.totalWeeks * 7;
+  let doneLessons = 0;
+  Object.values(map).forEach((v) => {
+    if (v.minutes > 0) doneLessons += 1;
+  });
+  const pct = Math.min(100, Math.round((doneLessons / totalLessons) * 100));
+  const curWeek = session ? session.week : 1;
+  const curDay = session ? session.dayOfWeek : 1;
+  const curNo = lessonNo(curWeek, curDay);
+
+  const units = plan.weekly
+    .map((w) => {
+      const dots = w.days
+        .map((d) => {
+          const rec = map[`${w.week}-${d.day}`];
+          const isToday = session && session.week === w.week && session.dayOfWeek === d.day;
+          let cls = 'dot';
+          if (rec && rec.minutes > 0) cls += ' done';
+          if (isToday) cls += ' now';
+          if (d.review) cls += ' review';
+          const label = d.review ? '复' : String(d.day);
+          return `<button class="${cls}" data-act="course-day" data-w="${w.week}" data-d="${d.day}">${label}</button>`;
+        })
+        .join('');
+      const weekDone = w.days.filter((d) => (map[`${w.week}-${d.day}`] || {}).minutes > 0).length;
+      const cls = [];
+      if (session && session.week === w.week) cls.push('cur');
+      if (w.week > curWeek) cls.push('lock');
+      return `<div class="unit ${cls.join(' ')}">
+        <div class="unit-head">
+          <span class="unit-no">第 ${w.week} 周</span>
+          <span class="unit-name">${esc(w.theme)}</span>
+          <span class="unit-count">${weekDone}/7</span>
+        </div>
+        <div class="unit-dots">${dots}</div>
+      </div>`;
+    })
+    .join('');
+
+  return `
+    <div class="course-hero">
+      <div class="ch-level">${LEVEL_LABEL[plan.level] || plan.level} · ${esc(plan.targetLabel || '')}</div>
+      <div class="ch-no">第 ${curNo} 课</div>
+      <div class="ch-name">${session ? esc(session.theme || '今天这一课') : '准备好就开课'}</div>
+      <div class="ch-bar"><i style="width:${pct}%"></i></div>
+      <div class="ch-meta">已完成 ${doneLessons} / ${totalLessons} 课 · ${pct}%</div>
+      <button class="btn" data-act="tab" data-id="today" style="margin-top:14px">继续今天的课</button>
+    </div>
+    <div class="course-list">${units}</div>`;
 }
 
 function viewToday() {
@@ -1546,6 +1630,22 @@ document.addEventListener('click', async (e) => {
       window.scrollTo({ top: 0 });
     } else if (act === 'open-task') {
       openTask(Number(t.dataset.idx));
+    } else if (act === 'course-day') {
+      const w = Number(t.dataset.w);
+      const d = Number(t.dataset.d);
+      const rec = courseMap()[`${w}-${d}`];
+      const s = App.boot.today;
+      if (s && s.week === w && s.dayOfWeek === d) {
+        App.view = 'today';
+        render();
+        window.scrollTo({ top: 0 });
+      } else if (rec && rec.minutes > 0) {
+        toast(`第 ${lessonNo(w, d)} 课已完成 · ${rec.minutes} 分钟`);
+      } else if (s && lessonNo(w, d) < lessonNo(s.week, s.dayOfWeek)) {
+        toast(`第 ${lessonNo(w, d)} 课那天没学，没关系，从今天这课接着走`);
+      } else {
+        toast('按顺序来，先把今天这课做完');
+      }
     } else if (act === 'shadow-record') {
       await shadowRecord();
     } else if (act === 'shadow-play') {
