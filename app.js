@@ -36,9 +36,9 @@ const App = {
   completed: new Set(),
   loading: true,
   error: null,
-  shadow: { queue: null, day: null, idx: 0, phase: 'idle', result: null, heard: '', loadPct: 0, loadTip: '' },
+  shadow: { queue: null, day: null, idx: 0, phase: 'idle', result: null, heard: '', loadPct: 0, loadTip: '', voiceErr: '', engine: '' },
   speakMode: 'shadow',
-  talk: { scene: null, msgs: [], busy: false, phase: 'idle', heard: '', err: '', draft: '', open: false },
+  talk: { scene: null, msgs: [], busy: false, phase: 'idle', heard: '', err: '', draft: '', open: false, voiceErr: '', engine: '', loadPct: 0 },
 };
 
 // 调试用：控制台里能直接看当前状态
@@ -67,11 +67,130 @@ function toast(msg) {
 
 function fmtMinutes(n) {
   n = Number(n) || 0;
+  if (n > 0 && n < 1) return '不到 1 分钟';
+  n = Math.round(n);
   if (n < 60) return `${n} 分钟`;
   const h = Math.floor(n / 60);
   const m = n % 60;
   return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
 }
+
+/* ============================== 真实学习计时 ==============================
+   以前记的分钟数是「计划值」——单词按 5 分钟摊到每个词，阅读写死 6 分钟，
+   跟你实际花了多久没关系。现在改成实测：
+
+   - 打开某一项开始计，只有「有动作」的时间才算（点按、打字、滚动都算动作）
+   - 连续 2 分钟没有任何动作就暂停——放下手机去吃饭不会被算成学习
+   - 切到后台也暂停
+   - 每一项结束按实测秒数折算分钟，保留一位小数
+   ======================================================================== */
+const STUDY_IDLE_GAP = 120000;
+
+const StudyClock = {
+  key: null,
+  activeMs: 0,
+  lastAct: 0,
+  lastAcc: 0,
+  ticker: null,
+
+  begin(key) {
+    if (this.key === key) return;
+    this.stop();
+    const now = Date.now();
+    this.key = key;
+    this.activeMs = 0;
+    this.lastAct = now;
+    this.lastAcc = now;
+    this.ticker = setInterval(() => this.tick(), 2000);
+    this.paint();
+  },
+
+  tick() {
+    const now = Date.now();
+    if (!document.hidden && now - this.lastAct <= STUDY_IDLE_GAP) {
+      this.activeMs += Math.min(Math.max(0, now - this.lastAcc), 5000);
+    }
+    this.lastAcc = now;
+    this.paint();
+  },
+
+  touch() {
+    if (!this.key) return;
+    this.lastAct = Date.now();
+  },
+
+  // 取走这一段的时间（不清 session）：单词卡每个词调用一次
+  split(floor) {
+    if (!this.key) return 0;
+    this.tick();
+    const ms = this.activeMs;
+    this.activeMs = 0;
+    this.lastAct = Date.now();
+    this.lastAcc = Date.now();
+    let min = Math.round((ms / 60000) * 10) / 10;
+    const f = floor == null ? 0.1 : floor;
+    if (ms > 0 && min < f) min = f;
+    return Math.min(180, min);
+  },
+
+  // 结束这一项，返回实测分钟
+  end(floor) {
+    if (!this.key) return 0;
+    this.tick();
+    const ms = this.activeMs;
+    this.stop();
+    let min = Math.round((ms / 60000) * 10) / 10;
+    const f = floor == null ? 0.2 : floor;
+    if (ms > 0 && min < f) min = f;
+    return Math.min(180, min);
+  },
+
+  // 中途关掉：时间照记，但不装作这项完成了
+  flushOnClose() {
+    if (!this.key) return;
+    const min = this.end();
+    if (min < 0.3) return;
+    fetchJson('/api/time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ minutes: min }),
+    })
+      .then(() => refreshBoot())
+      .catch(() => {});
+  },
+
+  stop() {
+    clearInterval(this.ticker);
+    this.ticker = null;
+    this.key = null;
+    this.activeMs = 0;
+    this.paint();
+  },
+
+  mmss() {
+    const s = Math.floor(this.activeMs / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  },
+
+  paint() {
+    const el = document.getElementById('studyClock');
+    if (!el) return;
+    el.textContent = this.key ? `⏱ ${this.mmss()}` : '';
+  },
+};
+
+App.clock = StudyClock; // 调试用：控制台里能看 activeMs / key
+
+// 页面上的任何动作都算「在学习」
+['pointerdown', 'keydown', 'scroll', 'touchstart', 'input'].forEach((ev) => {
+  document.addEventListener(ev, () => StudyClock.touch(), { passive: true });
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    StudyClock.lastAct = Date.now();
+    StudyClock.lastAcc = Date.now();
+  }
+});
 
 function weekdayCN(dateStr) {
   const d = new Date(`${dateStr}T00:00:00`);
@@ -105,6 +224,7 @@ function itemComplete(item) {
 
 /* ============================== 启动 ============================== */
 async function bootstrap() {
+  if (window.ASR && ASR.setProgressHook) ASR.setProgressHook(onAsrProgress);
   try {
     App.boot = await fetchJson('/api/bootstrap');
     App.loading = false;
@@ -888,7 +1008,8 @@ function viewShadow() {
         <button class="btn ghost" data-act="shadow-play-slow">🐢 慢速再听</button>
         <button class="btn mic" data-act="shadow-record">🎤 按住说一次</button>
       </div>
-      ${modelReady ? '' : `<div class="muted" style="font-size:13px;margin-top:10px;text-align:center">第一次点会下载 42MB 的语音模型</div>`}`;
+      ${modelReady ? '' : `<div class="muted" style="font-size:13px;margin-top:10px;text-align:center">第一次点会下载约 ${window.ASR ? ASR.packMb : 62}MB 的语音包，下完永久离线可用</div>`}
+      ${sh.voiceErr ? `<div class="voice-err">${esc(sh.voiceErr)}<div class="ve-sub"><button class="mini" data-act="tab" data-id="settings">去设置看语音诊断</button></div></div>` : ''}`;
   }
 
   return `
@@ -916,8 +1037,16 @@ const TALK_SCENES = [
   { id: 'intro', icon: '👋', name: '认识新同事', role: 'a new colleague at your company, it is your first day', goal: '自我介绍，说说你做什么，问对方做什么', open: "Hey! Are you new here? I'm Sam." },
   { id: 'hotel', icon: '🏨', name: '酒店入住', role: 'a hotel receptionist', goal: '报名字办入住，问早餐时间和 wifi 密码', open: 'Good evening! Checking in?' },
   { id: 'doctor', icon: '🩺', name: '看医生', role: 'a doctor at a walk-in clinic', goal: '说清楚哪里不舒服、多久了，问要不要吃药', open: "Come in, have a seat. What's going on?" },
-  { id: 'interview', icon: '💼', name: '面试', role: 'an interviewer for a junior role', goal: '介绍自己的经验，回答为什么想来这家公司', open: 'Thanks for coming in. Tell me a bit about yourself.' },
+  { id: 'interview', icon: '💼', name: '面试', role: 'an interviewer hiring for a junior role', goal: '介绍自己的经验，回答为什么想来这家公司', open: 'Thanks for coming in. Tell me a bit about yourself.' },
   { id: 'small', icon: '💬', name: '随便聊', role: 'a friendly English-speaking conversation partner', goal: '聊今天过得怎么样、最近在忙什么', open: "Hey! How's your day going?" },
+  { id: 'restaurant', icon: '🍽️', name: '餐厅吃饭', role: 'a waiter at a busy casual restaurant', goal: '点菜、问推荐、说忌口、最后买单', open: 'Good evening! Table for one? Here\'s the menu.' },
+  { id: 'shopping', icon: '👕', name: '买衣服', role: 'a helpful shop assistant in a clothing store', goal: '说想要的款式和尺码，试穿，问能不能退换', open: 'Hi! Looking for anything in particular?' },
+  { id: 'bank', icon: '🏦', name: '银行办事', role: 'a bank clerk at the counter', goal: '说清楚要办什么业务，回答身份和账户问题', open: 'Good morning. How can I help you today?' },
+  { id: 'phone', icon: '📞', name: '打客服电话', role: 'a customer service agent on the phone', goal: '说明问题（订单/退款/网络），争取一个解决方案', open: 'Thanks for calling. May I have your order number?' },
+  { id: 'airport', icon: '✈️', name: '机场值机', role: 'an airline check-in agent', goal: '办值机、托运行李、问登机口和延误', open: 'Good morning! Passport and booking reference, please.' },
+  { id: 'rent', icon: '🏠', name: '看房租房', role: 'a landlord showing a small apartment', goal: '问租金、押金、水电和能不能养宠物', open: "So this is the place — what do you think?" },
+  { id: 'gym', icon: '🏋️', name: '健身房办卡', role: 'a gym salesperson at the front desk', goal: '问价格、课程、能不能先试一次', open: "Hi! First time here? Let me show you around." },
+  { id: 'opinion', icon: '🗣️', name: '聊观点', role: 'a thoughtful friend who likes a good argument', goal: '就一个话题表态、给理由、回应对方反驳', open: "Random question — do you think working from home is better?" },
 ];
 
 function talkScene() {
@@ -986,16 +1115,29 @@ function talkBubbles() {
       <div class="muted" style="font-size:13px;margin-top:8px">点下面的麦克风说一句，或者直接打英文发出去。</div>
     </div>`;
   }
-  return t.msgs.map((m) => {
+  const lines = t.msgs.map((m) => {
     if (m.role === 'me') return `<div class="bubble me"><div class="b-text">${esc(m.text)}</div></div>`;
     if (m.role === 'sys') return `<div class="bubble sys">${esc(m.text)}</div>`;
     return `<div class="bubble ai">
       <div class="b-text">${esc(m.text)}</div>
       ${m.fix ? `<div class="b-fix">✏️ ${esc(m.fix)}</div>` : ''}
+      ${m.polish ? `<div class="b-polish">✨ 更地道：${esc(m.polish)}</div>` : ''}
       ${m.hint ? `<div class="b-hint">💡 ${esc(m.hint)}</div>` : ''}
       <button class="b-say" data-act="talk-say" data-i="${t.msgs.indexOf(m)}">🔊 再听一遍</button>
     </div>`;
   }).join('');
+
+  // 这一练挑出来的错，攒成一份可以回头看的清单
+  const fixes = t.msgs.filter((m) => m.role === 'ai' && m.fix).map((m) => m.fix);
+  const polish = t.msgs.filter((m) => m.role === 'ai' && m.polish).map((m) => m.polish);
+  const review = fixes.length
+    ? `<details class="talk-review">
+        <summary>这一练我挑出 ${fixes.length} 处，回头再看一眼</summary>
+        <ul>${fixes.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
+        ${polish.length ? `<div class="tr-sub">更地道的说法</div><ul>${polish.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
+      </details>`
+    : '';
+  return lines + review;
 }
 
 function viewTalk() {
@@ -1008,8 +1150,8 @@ function viewTalk() {
   let footer = '';
   if (t.phase === 'loading') {
     footer = `<div class="talk-status"><div class="spin"></div>
-      <div class="muted" style="font-size:13px">第一次用要加载语音模型，大概 42MB</div>
-      <div class="bar" style="width:100%;margin-top:8px"><i id="loadBar" style="width:0%"></i></div>
+      <div class="muted" style="font-size:13px">正在准备语音引擎（第一次要下约 ${window.ASR ? ASR.packMb : 62}MB，之后不用再下）</div>
+      <div class="bar" style="width:100%;margin-top:8px"><i id="loadBar" style="width:${t.loadPct || 0}%"></i></div>
       <div class="muted" id="loadTip" style="font-size:12px;margin-top:6px">正在准备…</div></div>`;
   } else if (t.phase === 'recording') {
     footer = `<div class="talk-status"><div class="rec-dot"></div>
@@ -1035,6 +1177,7 @@ function viewTalk() {
     </div>
     <div class="talk-body" id="talkBody">${talkBubbles()}</div>
     ${t.heard ? `<div class="talk-heard">听到的是：${esc(t.heard)}</div>` : ''}
+    ${t.voiceErr ? `<div class="talk-err">${esc(t.voiceErr)}<button class="mini" data-act="tab" data-id="settings">语音诊断</button></div>` : ''}
     <div class="talk-pad"></div>
     ${footer}`;
 }
@@ -1066,31 +1209,39 @@ async function talkSend(text) {
   try {
     const profile = (App.boot && App.boot.profile) || {};
     const level = profile.level || 'A1';
+    const turnNo = t.msgs.filter((m) => m.role === 'me').length;
     const sys = [
       'You are ' + s.role + '.',
-      'You are talking with a Chinese learner of English, CEFR level ' + level + '.',
-      'Their goal in this scene: ' + s.goal + '.',
+      'You are talking with a Chinese learner of English, CEFR level ' + level + '. Stay in character the whole time.',
+      'The scene goal for them: ' + s.goal + '. This is their turn ' + turnNo + '.',
       '',
-      'Rules:',
-      '- Reply in English only, 1-2 short natural spoken sentences. Stay in character, do not explain the scene.',
-      '- Keep it going: usually end with a simple question back to them.',
-      '- "fix": if their last sentence has a real error (grammar, wrong word, unnatural phrasing), point it out in Chinese, short, with the corrected English. If it is fine, use "".',
-      '- "hint": a short Chinese hint for what they could say next. Keep it optional and light.',
+      'How to speak:',
+      '- English only, 1-2 short sentences, spoken style. Use contractions (I am -> I\'m, do not -> don\'t).',
+      '- Sound like a person, not a textbook: often open with a short reaction ("Oh really?", "Yeah, sure.", "Hmm, okay."), then say your bit.',
+      '- Never start two replies the same way. Do not describe the scene, do not explain what you are doing, do not list options.',
+      '- Usually end with one short question, so they have something easy to answer.',
+      '- Move the scene forward: after a few turns, take the next natural step of the real situation.',
       '',
-      'Return STRICT JSON only, no markdown:',
-      '{"reply":"...","hint":"...","fix":"..."}',
+      'How to correct (this matters most):',
+      '- "fix": only when their last sentence has a real error. Format: `错的地方 -> 正确说法：一句中文点语法点`. Example: "He go -> He went：过去时要用 went". Always name the exact word or grammar point. Never write vague advice like 注意语法 or 多练习.',
+      '- "polish": the same idea said the way a native speaker would. English only. Give it only when their sentence is not wrong but sounds Chinese-ish; otherwise "".',
+      '- "hint": one short Chinese hint for what they could say next, at most 15 字. May be "".',
+      '- If their sentence is already correct and natural, "fix" must be "". Never invent a mistake.',
+      '',
+      'Return STRICT JSON only, no markdown, no extra keys:',
+      '{"reply":"...","hint":"...","fix":"...","polish":"..."}',
     ].join('\n');
 
     const msgs = [{ role: 'system', content: sys }];
     const hist = t.msgs.slice(0, -1).slice(-8);
     for (const m of hist) {
       if (m.role === 'me') msgs.push({ role: 'user', content: m.text });
-      else if (m.role === 'ai') msgs.push({ role: 'assistant', content: JSON.stringify({ reply: m.text, hint: '', fix: '' }) });
+      else if (m.role === 'ai') msgs.push({ role: 'assistant', content: JSON.stringify({ reply: m.text, hint: '', fix: '', polish: '' }) });
     }
     msgs.push({ role: 'user', content: text });
 
-    const raw = await Chat.ask(msgs, { json: true, maxTokens: 320, temperature: 0.8 });
-    const j = Chat.parseJson(raw) || { reply: raw, hint: '', fix: '' };
+    const raw = await Chat.ask(msgs, { json: true, maxTokens: 380, temperature: 0.85 });
+    const j = Chat.parseJson(raw) || { reply: raw, hint: '', fix: '', polish: '' };
     const reply = String(j.reply || '').trim() || raw;
 
     t.msgs.push({
@@ -1098,6 +1249,7 @@ async function talkSend(text) {
       text: reply,
       hint: String(j.hint || '').trim(),
       fix: String(j.fix || '').trim(),
+      polish: String(j.polish || '').trim(),
       ts: Date.now(),
     });
     talkSave();
@@ -1117,69 +1269,35 @@ async function talkRecord() {
   const t = App.talk;
   if (t.busy || t.phase !== 'idle') return;
   if (!window.ASR) { toast('语音模块没加载上，刷新一下再试'); return; }
-  if (!ASR.hasMic()) { toast('这个浏览器拿不到麦克风，打字也行'); return; }
-
-  if (!ASR.ready) {
-    t.phase = 'loading';
-    t.busy = true;
-    render();
-    try {
-      await ASR.load((p) => {
-        const bar = document.getElementById('loadBar');
-        const tip = document.getElementById('loadTip');
-        if (!p || !p.file) return;
-        let pct = 0;
-        if (p.status === 'progress' && typeof p.progress === 'number') pct = p.progress;
-        if (bar) bar.style.width = pct + '%';
-        if (tip) tip.textContent = p.file + ' ' + Math.round(pct) + '%';
-      });
-    } catch (e) {
-      t.phase = 'idle';
-      t.busy = false;
-      render();
-      toast('语音模型没加载上：' + (e && e.message ? e.message : e));
-      return;
-    }
-    t.busy = false;
-  }
+  if (!ASR.hasMic()) { toast('这个浏览器拿不到麦克风，打字也完全可以'); return; }
 
   t.phase = 'recording';
+  t.busy = true;
+  t.voiceErr = '';
   render();
-
-  let secs = 0;
-  const ticker = setInterval(() => {
-    secs += 0.2;
-    const el = document.getElementById('recTip');
-    if (el) el.textContent = '正在听… ' + secs.toFixed(1) + ' 秒';
-  }, 200);
-
   try {
-    const rec = await ASR.record({ maxMs: 15000 });
-    clearInterval(ticker);
-    if (!rec || !rec.ok) {
-      t.phase = 'idle';
-      render();
-      toast(rec && rec.reason === 'nospeech' ? '没听到声音，再说一次？' : '这次没录上');
-      return;
-    }
-    t.phase = 'scoring';
-    render();
-    const out = await ASR.transcribe(rec.samples);
-    const text = String((out && out.text) || '').trim();
+    const out = await ASR.listen({
+      prefer: 'speed',
+      maxMs: 12000,
+      onStage: (st) => {
+        if (st === 'local:load') t.phase = 'loading';
+        else if (st === 'local:record' || st === 'browser:record') t.phase = 'recording';
+        else if (st === 'local:transcribe') t.phase = 'scoring';
+        render();
+      },
+    });
+    t.busy = false;
     t.phase = 'idle';
-    if (!text) {
-      render();
-      toast('这句没听清，再试一次');
-      return;
-    }
-    t.heard = text;
+    t.heard = out.text;
+    t.engine = out.engine;
     render();
-    await talkSend(text);
+    await talkSend(out.text);
   } catch (e) {
-    clearInterval(ticker);
+    t.busy = false;
     t.phase = 'idle';
+    t.voiceErr = ASR.describe(e);
     render();
-    toast('录音出错了：' + (e && e.message ? e.message : e));
+    toast(t.voiceErr);
   }
 }
 
@@ -1189,79 +1307,48 @@ async function shadowRecord() {
   const item = shadowCurrent();
   if (!item) return;
 
-  if (!ASR.ready) {
-    App.shadow.phase = 'loading';
-    App.shadow.loadPct = 0;
-    App.shadow.loadTip = '正在加载语音模型…';
-    render();
-    try {
-      await ASR.load((p) => {
-        const bar = document.getElementById('loadBar');
-        const tip = document.getElementById('loadTip');
-        if (!p || !p.file) return;
-        let pct = App.shadow.loadPct || 0;
-        if (p.status === 'progress' && typeof p.progress === 'number') pct = Math.max(pct, p.progress);
-        if (p.status === 'done') pct = Math.max(pct, 0);
-        App.shadow.loadPct = pct;
-        App.shadow.loadTip = p.file + ' ' + Math.round(pct) + '%';
-        if (bar) bar.style.width = pct + '%';
-        if (tip) tip.textContent = App.shadow.loadTip;
-      });
-    } catch (e) {
-      App.shadow.phase = 'idle';
-      render();
-      toast('模型没加载起来：' + ((e && e.message) || '未知错误'));
-      return;
-    }
-  }
-
-  App.shadow.phase = 'recording';
+  const sh = App.shadow;
+  sh.phase = 'recording';
+  sh.voiceErr = '';
+  sh.loadPct = 0;
   render();
   window.scrollTo(0, 0);
-  let rec;
   const startedAt = Date.now();
   const tick = setInterval(() => {
     const tip = document.getElementById('recTip');
     if (tip) tip.textContent = '正在录… ' + ((Date.now() - startedAt) / 1000).toFixed(1) + ' 秒';
   }, 200);
   try {
-    rec = await ASR.record({
+    const out = await ASR.listen({
+      prefer: 'accuracy',
       maxMs: 20000,
+      onStage: (st) => {
+        if (st === 'local:load') sh.phase = 'loading';
+        else if (st === 'local:record' || st === 'browser:record') sh.phase = 'recording';
+        else if (st === 'local:transcribe') sh.phase = 'scoring';
+        render();
+      },
       onLevel: (rms) => {
         const el = document.getElementById('lvl');
         if (el) el.style.width = Math.min(100, Math.max(4, rms * 700)) + '%';
       },
     });
-  } catch (e) {
     clearInterval(tick);
-    App.shadow.phase = 'idle';
+    sh.phase = 'scoring';
     render();
-    toast('录音没开始：' + ((e && e.message) || '检查一下麦克风权限'));
-    return;
-  }
-  clearInterval(tick);
-
-  if (!rec.spoke) {
-    App.shadow.phase = 'idle';
-    render();
-    toast('没听清，靠近一点再说一次');
-    return;
-  }
-
-  App.shadow.phase = 'scoring';
-  render();
-  try {
-    const out = await ASR.transcribe(rec.audio);
     const result = ASR.scoreReading(item.en, out.text);
     const list = shadowDone();
-    list.push({ id: item.id, score: result.score, ts: Date.now(), heard: out.text, seconds: rec.seconds });
+    list.push({ id: item.id, score: result.score, ts: Date.now(), heard: out.text, seconds: out.seconds || 0 });
     window.Engine.saveState();
-    App.shadow.result = result;
-    App.shadow.heard = out.text;
-    App.shadow.phase = 'result';
+    sh.result = result;
+    sh.heard = out.text;
+    sh.engine = out.engine;
+    sh.phase = 'result';
   } catch (e) {
-    App.shadow.phase = 'idle';
-    toast('识别没成功：' + ((e && e.message) || '再试一次'));
+    clearInterval(tick);
+    sh.phase = 'idle';
+    sh.voiceErr = ASR.describe(e);
+    toast(sh.voiceErr);
   }
   render();
 }
@@ -1311,7 +1398,106 @@ function aiCardHtml() {
     </div>`;
 }
 
+/* ---------- 语音：诊断 / 引擎切换 / 下载语音包 ---------- */
+const VoiceUI = {
+  pct: 0,
+  busy: false,
+  note: '',
+  diag: null,
+  cache: null,
+  cachePending: false,
+  testing: false,
+  testMsg: '',
+
+  refresh(force) {
+    if (!window.ASR) return;
+    try { this.diag = ASR.diagnose(); } catch (e) { this.diag = null; }
+    if ((this.cache === null || force) && !this.cachePending) {
+      this.cachePending = true;
+      ASR.checkCache()
+        .then((r) => {
+          this.cache = r;
+          this.cachePending = false;
+          if (App.view === 'settings') render();
+        })
+        .catch(() => { this.cachePending = false; });
+    }
+  },
+};
+
+// 模型加载进度：跟读页和对话页共用一套
+function onAsrProgress(p) {
+  if (!p || !p.file) return;
+  let pct = 0;
+  if (p.status === 'progress' && typeof p.progress === 'number') pct = Math.min(100, Math.max(0, p.progress));
+  else if (p.status === 'done') pct = 100;
+  App.shadow.loadPct = pct;
+  App.talk.loadPct = pct;
+  App.shadow.loadTip = p.file + ' ' + Math.round(pct) + '%';
+  const bar = document.getElementById('loadBar');
+  const tip = document.getElementById('loadTip');
+  if (bar) bar.style.width = pct + '%';
+  if (tip) tip.textContent = App.shadow.loadTip;
+}
+
+function voiceCardHtml() {
+  const has = !!window.ASR;
+  const d = VoiceUI.diag || (has ? ASR.diagnose() : {});
+  const pref = has ? ASR.pref() : 'auto';
+  const cache = VoiceUI.cache;
+  const packMb = has ? ASR.packMb : 62;
+  const row = (label, ok, extra) =>
+    `<div class="row between" style="font-size:14px;line-height:2"><span class="muted">${label}</span><span class="${ok ? 'v-ok' : 'v-bad'}">${extra || (ok ? '正常' : '不可用')}</span></div>`;
+
+  const cacheTxt = !cache
+    ? '检查中…'
+    : cache.complete
+    ? '已下好，离线可用'
+    : `还差 ${Math.round(cache.totalMb - cache.cachedMb)}MB`;
+
+  return `<div class="card">
+    <h3 style="font-size:15px">语音（跟读打分 / 对话说话）</h3>
+    <p class="muted" style="font-size:13px;margin-top:6px;line-height:1.7">
+      跟读打分靠手机上的本地模型，全程不联网。语音输入有两条路：手机自带识别（快，但要能连上它的服务）
+      和这套本地模型（第一次下 ${packMb}MB，之后永久离线）。哪条通就走哪条，一条不通自动换另一条。
+    </p>
+    <div style="margin-top:12px">
+      ${row('麦克风接口', d.mic, d.mic ? '可用' : '没有（浏览器不支持）')}
+      ${row('手机自带识别', d.sr, d.sr ? '有' : '没有')}
+      ${row('语音引擎 wasm', d.wasm, d.wasm ? '可用' : '没有（浏览器太旧）')}
+      ${row('语音包', !!(cache && cache.complete), cacheTxt)}
+      ${d.secure === false ? `<div class="voice-err">当前不是 https 页面，浏览器不给麦克风权限。用线上地址打开就好。</div>` : ''}
+      ${d.error ? `<div class="voice-err">上次的错误：${esc(d.error)}</div>` : ''}
+    </div>
+    <div class="seg-title" style="margin-top:16px">用哪条路</div>
+    <div class="chips">
+      ${[
+        ['auto', '自动（推荐）'],
+        ['browser', '只用手机自带识别'],
+        ['local', '只用本地模型'],
+      ]
+        .map((x) => `<button class="chip ${pref === x[0] ? 'on' : ''}" data-act="voice-engine" data-id="${x[0]}">${x[1]}</button>`)
+        .join('')}
+    </div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn sm" style="flex:1" data-act="voice-pack" ${VoiceUI.busy ? 'disabled' : ''}>
+        ${cache && cache.complete ? '重新下载语音包' : `下载语音包（${packMb}MB）`}
+      </button>
+      <button class="btn sm ghost" style="flex:1" data-act="voice-test" ${VoiceUI.testing ? 'disabled' : ''}>
+        ${VoiceUI.testing ? '正在听…' : '测一下麦克风'}
+      </button>
+    </div>
+    ${VoiceUI.note ? `<div class="bar" style="margin-top:12px"><i id="packBar" style="width:${VoiceUI.pct}%"></i></div>
+      <div class="muted" id="packTip" style="font-size:12.5px;margin-top:6px">${esc(VoiceUI.note)}</div>` : ''}
+    ${VoiceUI.testMsg ? `<div class="voice-note">${esc(VoiceUI.testMsg)}</div>` : ''}
+    <p class="muted" style="font-size:12.5px;margin-top:10px;line-height:1.7">
+      「手机自带识别」在国产浏览器里经常报网络错——那是它连不上自己的服务，不是你的手机坏了，切回自动就会用本地模型。
+    </p>
+  </div>`;
+}
+
 function viewSettings() {
+  VoiceUI.refresh(false);
   const profile = App.boot.profile;
   const plan = App.boot.plan;
   const aiNotes = (plan && plan.aiNotes) || null;
@@ -1348,6 +1534,7 @@ function viewSettings() {
       <button class="btn sm" style="margin-top:14px" data-act="apply-plan">按新设置重排计划</button>
     </div>
     ${aiCardHtml()}
+    ${voiceCardHtml()}
     <div class="card">
       <h3 style="font-size:15px">AI 老师的意见</h3>
       ${
@@ -1389,6 +1576,7 @@ function modalHost() {
 }
 
 function closeModal() {
+  StudyClock.flushOnClose();
   const host = document.getElementById('modalRoot');
   if (host) host.innerHTML = '';
   App.modal = null;
@@ -1403,6 +1591,7 @@ function openTask(idx) {
     return;
   }
   App.modal = { item, idx, state: initModalState(item) };
+  StudyClock.begin(item.key);
   renderModal();
 }
 
@@ -1420,7 +1609,7 @@ function modalFrame(title, bodyHtml, footHtml) {
     <div class="modal-head">
       <button class="close" data-act="close-modal">×</button>
       <div class="title">${esc(title)}</div>
-      <div style="width:34px"></div>
+      <div class="study-clock" id="studyClock">${StudyClock.key ? `⏱ ${StudyClock.mmss()}` : ''}</div>
     </div>
     <div class="modal-body" id="modalBody">${bodyHtml}</div>
     <div class="modal-foot" id="modalFoot">${footHtml}</div>
@@ -1484,7 +1673,7 @@ async function rateVocab(rating) {
   const st = m.state;
   const words = m.item.words;
   const w = words[st.wordIdx];
-  const per = Math.max(0.5, (m.item.minutes || 5) / Math.max(1, words.length));
+  const per = StudyClock.split();
   try {
     await fetchJson('/api/answer', {
       method: 'POST',
@@ -1601,7 +1790,7 @@ async function finishReading(host, m, early) {
         refId: a.id,
         correct,
         total,
-        minutes: m.item.minutes || 6,
+        minutes: StudyClock.end(),
       }),
     });
   } catch (e) {
@@ -1693,7 +1882,7 @@ async function finishGrammar(host, m) {
         refId: g.id,
         correct: m.state.correct,
         total,
-        minutes: m.item.minutes || 6,
+        minutes: StudyClock.end(),
       }),
     });
   } catch (e) {
@@ -1814,7 +2003,7 @@ async function finishListening(host, m) {
         key: m.item.key,
         correct: m.state.correct,
         total,
-        minutes: m.item.minutes || 5,
+        minutes: StudyClock.end(),
       }),
     });
   } catch (e) {
@@ -1883,7 +2072,7 @@ async function finishSpeaking(host, m) {
         refId: t.id,
         correct: checked,
         total,
-        minutes: m.item.minutes || 8,
+        minutes: StudyClock.end(),
       }),
     });
     if (draft && draft.value.trim()) {
@@ -2010,7 +2199,7 @@ document.addEventListener('click', async (e) => {
       App.talk.err = '';
       const sc = TALK_SCENES.find((x) => x.id === App.talk.scene);
       if (sc) {
-        App.talk.msgs.push({ role: 'ai', text: sc.open, hint: '', fix: '', ts: Date.now() });
+        App.talk.msgs.push({ role: 'ai', text: sc.open, hint: '', fix: '', polish: '', ts: Date.now() });
         speak(sc.open);
       }
       talkSave();
@@ -2040,6 +2229,52 @@ document.addEventListener('click', async (e) => {
       } catch (e) {
         toast('没通：' + Chat.describe(e));
       }
+    } else if (act === 'voice-engine') {
+      ASR.setPref(t.dataset.id);
+      VoiceUI.diag = ASR.diagnose();
+      VoiceUI.cache = null;
+      render();
+    } else if (act === 'voice-pack') {
+      if (VoiceUI.busy) return;
+      VoiceUI.busy = true;
+      VoiceUI.pct = 0;
+      VoiceUI.note = '开始下载…';
+      render();
+      try {
+        await ASR.prefetchPack((pp) => {
+          VoiceUI.pct = Math.round(pp.pct);
+          VoiceUI.note = pp.file
+            ? `${pp.file} · 已下 ${Math.round(pp.doneMb)}MB / ${Math.round(pp.totalMb)}MB`
+            : '下好了';
+          const bar = document.getElementById('packBar');
+          if (bar) bar.style.width = VoiceUI.pct + '%';
+          const tip = document.getElementById('packTip');
+          if (tip) tip.textContent = VoiceUI.note;
+        });
+        VoiceUI.cache = { complete: true, cachedMb: ASR.packMb, totalMb: ASR.packMb };
+        VoiceUI.note = '语音包下好了，以后离线也能用';
+        toast('语音包存进手机了');
+      } catch (e) {
+        VoiceUI.note = '下载失败：' + ((e && e.message) || e);
+        toast('下载没成，再试一次');
+      }
+      VoiceUI.busy = false;
+      VoiceUI.diag = ASR.diagnose();
+      render();
+    } else if (act === 'voice-test') {
+      if (VoiceUI.testing) return;
+      VoiceUI.testing = true;
+      VoiceUI.testMsg = '听完一句就停，说句英文试试…';
+      render();
+      try {
+        const out = await ASR.listen({ maxMs: 8000, prefer: 'speed' });
+        VoiceUI.testMsg = `通了（${out.engine === 'browser' ? '手机自带识别' : '本地模型'}）：${out.text}`;
+      } catch (e) {
+        VoiceUI.testMsg = '没通：' + ASR.describe(e);
+      }
+      VoiceUI.testing = false;
+      VoiceUI.diag = ASR.diagnose();
+      render();
     } else if (act === 'talk-exit') {
       talkSave();
       App.talk.scene = null;
