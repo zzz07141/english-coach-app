@@ -1817,3 +1817,131 @@ p {
     color: #e08b7c;
   }
 }
+
+/* ---------- 真实学习计时（练习弹层右上角） ---------- */
+.modal-head .study-clock {
+  min-width: 52px;
+  text-align: right;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3, #8a8377);
+  letter-spacing: 0.02em;
+}
+
+/* ---------- 语音：报错与诊断 ---------- */
+.voice-err {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(163, 59, 47, 0.07);
+  border: 1px solid rgba(163, 59, 47, 0.18);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--bad, #a33b2f);
+  white-space: pre-wrap;
+}
+.voice-err .ve-sub {
+  margin-top: 6px;
+}
+.voice-note {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(47, 107, 94, 0.07);
+  border: 1px solid rgba(47, 107, 94, 0.16);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  word-break: break-word;
+}
+.v-ok {
+  color: var(--brand, #2f6b5e);
+  font-size: 13.5px;
+}
+.v-bad {
+  color: var(--bad, #a33b2f);
+  font-size: 13.5px;
+}
+.talk-err {
+  position: relative;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(163, 59, 47, 0.07);
+  border: 1px solid rgba(163, 59, 47, 0.18);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--bad, #a33b2f);
+}
+.talk-err .mini {
+  margin-left: 8px;
+}
+.b-polish {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--brand, #2f6b5e);
+  line-height: 1.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  .voice-err {
+    background: rgba(214, 122, 110, 0.12);
+    border-color: rgba(214, 122, 110, 0.3);
+    color: #e3a49b;
+  }
+  .voice-note {
+    background: rgba(120, 196, 178, 0.1);
+    border-color: rgba(120, 196, 178, 0.24);
+  }
+  .v-ok {
+    color: #78c4b2;
+  }
+  .v-bad {
+    color: #e3a49b;
+  }
+  .talk-err {
+    background: rgba(214, 122, 110, 0.12);
+    border-color: rgba(214, 122, 110, 0.3);
+    color: #e3a49b;
+  }
+  .b-polish {
+    color: #78c4b2;
+  }
+}
+
+/* ---------- 对话：这一练的纠错清单 ---------- */
+.talk-review {
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--card-2, rgba(0, 0, 0, 0.03));
+  border: 1px solid var(--line-soft, rgba(0, 0, 0, 0.07));
+  font-size: 13.5px;
+}
+.talk-review summary {
+  cursor: pointer;
+  color: var(--brand, #2f6b5e);
+  font-size: 13.5px;
+  outline: none;
+}
+.talk-review ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  line-height: 1.75;
+  color: var(--ink-2);
+}
+.talk-review .tr-sub {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--ink-3, #8a8377);
+}
+
+@media (prefers-color-scheme: dark) {
+  .talk-review {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .talk-review summary {
+    color: #78c4b2;
+  }
+}
