@@ -105,28 +105,35 @@ const StudyClock = {
     this.paint();
   },
 
-  tick() {
+  // 按墙钟结算，不依赖定时器准不准：手机浏览器会节流 setInterval
+  // （后台一分钟才跳一次），只靠 tick 累加会漏掉大段时间。
+  settle() {
     const now = Date.now();
     const quiet = now - this.lastAct;
-    // 看得见的时候，2 分钟没动作才停；切到后台只给 20 秒（有些 App 内浏览器
-    // 一直报 hidden，但你在点，照样得算上，否则时长会全是 0）
+    // 看得见时 2 分钟没动作算走开；页面报 hidden 时只给 20 秒
+    // （有些 App 内浏览器一直报 hidden，但你在点，不能被判成走开）
     const limit = document.hidden ? 20000 : STUDY_IDLE_GAP;
     if (quiet <= limit) {
-      this.activeMs += Math.min(Math.max(0, now - this.lastAcc), 5000);
+      this.activeMs += Math.min(Math.max(0, now - this.lastAcc), 60000);
     }
     this.lastAcc = now;
+  },
+
+  tick() {
+    this.settle();
     this.paint();
   },
 
   touch() {
     if (!this.key) return;
+    this.settle();
     this.lastAct = Date.now();
   },
 
   // 取走这一段的时间（不清 session）：单词卡每个词调用一次
   split(floor) {
     if (!this.key) return 0;
-    this.tick();
+    this.settle();
     const ms = this.activeMs;
     this.activeMs = 0;
     this.lastAct = Date.now();
@@ -140,7 +147,7 @@ const StudyClock = {
   // 结束这一项，返回实测分钟
   end(floor) {
     if (!this.key) return 0;
-    this.tick();
+    this.settle();
     const ms = this.activeMs;
     this.stop();
     let min = Math.round((ms / 60000) * 10) / 10;
