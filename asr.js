@@ -19,15 +19,41 @@
   var PREF_KEY = 'english-coach-voice-v1';
 
   // 语音包清单（第一次要下这些，之后永久离线可用）
+  // GitHub Pages 在国内经常只有 30-80KB/s，jsDelivr 的同一个文件能到 300-800KB/s，
+  // 所以每个文件都尽量给一个镜像源，下载时先试镜像、失败再回落到同源。
+  // jsDelivr 单文件上限 20MB —— 30MB 的 decoder 只能走 GitHub Pages（多路分段并行）。
+  var GH_MIRROR = 'https://cdn.jsdelivr.net/gh/zzz07141/english-coach-app@main/';
+  var NPM_MIRROR = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5/dist/';
   var PACK = [
-    { url: './vendor/ort-wasm-simd-threaded.jsep.wasm', mb: 20.6 },
-    { url: './whisper-tiny.en/config.json', mb: 0.01 },
-    { url: './whisper-tiny.en/generation_config.json', mb: 0.01 },
-    { url: './whisper-tiny.en/preprocessor_config.json', mb: 0.01 },
-    { url: './whisper-tiny.en/tokenizer.json', mb: 2.03 },
-    { url: './whisper-tiny.en/tokenizer_config.json', mb: 0.01 },
-    { url: './whisper-tiny.en/onnx/encoder_model_quantized.onnx', mb: 9.66 },
-    { url: './whisper-tiny.en/onnx/decoder_model_merged_quantized.onnx', mb: 29.3 },
+    {
+      url: './vendor/ort-wasm-simd-threaded.jsep.wasm',
+      mb: 20.6,
+      mirrors: [NPM_MIRROR + 'ort-wasm-simd-threaded.jsep.wasm'],
+    },
+    { url: './whisper-tiny.en/config.json', mb: 0.01, mirrors: [GH_MIRROR + 'whisper-tiny.en/config.json'] },
+    {
+      url: './whisper-tiny.en/generation_config.json',
+      mb: 0.01,
+      mirrors: [GH_MIRROR + 'whisper-tiny.en/generation_config.json'],
+    },
+    {
+      url: './whisper-tiny.en/preprocessor_config.json',
+      mb: 0.01,
+      mirrors: [GH_MIRROR + 'whisper-tiny.en/preprocessor_config.json'],
+    },
+    { url: './whisper-tiny.en/tokenizer.json', mb: 2.03, mirrors: [GH_MIRROR + 'whisper-tiny.en/tokenizer.json'] },
+    {
+      url: './whisper-tiny.en/tokenizer_config.json',
+      mb: 0.01,
+      mirrors: [GH_MIRROR + 'whisper-tiny.en/tokenizer_config.json'],
+    },
+    {
+      url: './whisper-tiny.en/onnx/encoder_model_quantized.onnx',
+      mb: 9.66,
+      mirrors: [GH_MIRROR + 'whisper-tiny.en/onnx/encoder_model_quantized.onnx'],
+    },
+    // 30MB，超 jsDelivr 单文件上限，没有镜像
+    { url: './whisper-tiny.en/onnx/decoder_model_merged_quantized.onnx', mb: 29.3, mirrors: [] },
   ];
   var PACK_MB = PACK.reduce(function (n, x) { return n + x.mb; }, 0);
 
@@ -475,26 +501,24 @@
     return { cachedMb: Math.round(got * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10, complete: cacheFlag };
   }
 
-  // 单文件：拿 Range 总量 → 分段并发 → 拼成 Blob → cache.put(原 URL)
-  async function grab(url, onProgress) {
-    if (await hasCached(url)) {
-      if (onProgress) onProgress(1);
-      return;
-    }
-    var probe = await fetch(url + '?pf=1', { headers: { Range: 'bytes=0-0' } });
-    if (!probe.ok && probe.status !== 206) throw new Error('拿不到 ' + url + '（HTTP ' + probe.status + '）');
+  // 单个源：拿 Range 总量 → 分段并发（带重试）→ 拼成 Blob → cache.put(原 URL)
+  async function grabOne(src, targetUrl, onProgress) {
+    var probe = await fetch(src + (src.charAt(0) === '.' ? '?pf=1' : ''), { headers: { Range: 'bytes=0-0' } });
+    if (!probe.ok && probe.status !== 206) throw new Error('HTTP ' + probe.status);
+
     var total = 0;
     var cr = probe.headers.get('Content-Range');
     if (probe.status === 206 && cr) {
-      var m = /\/(\d+)\s*$/.exec(cr);
-      if (m) total = Number(m[1]);
+      var mm = /\/(\d+)\s*$/.exec(cr);
+      if (mm) total = Number(mm[1]);
     }
     if (probe.status === 200) {
-      // 服务器不认 Range：只能整包下
+      // 服务器不认 Range：整包下（探测那个响应本身就是全量）
       var blob0 = await probe.blob();
-      await putBlob(url, blob0);
+      if (!blob0.size) throw new Error('空文件');
+      await putBlob(targetUrl, blob0);
       if (onProgress) onProgress(1);
-      return;
+      return blob0.size;
     }
     try { probe.body && probe.body.cancel && probe.body.cancel(); } catch (e) {}
     if (!total) throw new Error('读不到文件大小');
@@ -505,27 +529,64 @@
     var next = 0;
     var doneBytes = 0;
 
+    async function fetchChunk(idx) {
+      var start = idx * CHUNK;
+      var end = Math.min(total - 1, start + CHUNK - 1);
+      var lastErr = null;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        try {
+          var res = await fetch(src + (src.charAt(0) === '.' ? '?pf=1' : ''), {
+            headers: { Range: 'bytes=' + start + '-' + end },
+          });
+          if (res.status !== 206) throw new Error('HTTP ' + res.status);
+          return await res.arrayBuffer();
+        } catch (e) {
+          lastErr = e;
+          await new Promise(function (r) { setTimeout(r, 400 * (attempt + 1)); });
+        }
+      }
+      throw lastErr || new Error('分段失败');
+    }
+
     async function worker() {
       for (;;) {
         var idx = next++;
         if (idx >= parts.length) return;
-        var start = idx * CHUNK;
-        var end = Math.min(total - 1, start + CHUNK - 1);
-        var res = await fetch(url + '?pf=1', { headers: { Range: 'bytes=' + start + '-' + end } });
-        if (res.status !== 206) throw new Error('分段下载失败（HTTP ' + res.status + '）');
-        parts[idx] = await res.arrayBuffer();
+        parts[idx] = await fetchChunk(idx);
         doneBytes += parts[idx].byteLength;
         if (onProgress) onProgress(Math.min(1, doneBytes / total));
       }
     }
+
     var ws = [];
     for (var k = 0; k < CONC; k++) ws.push(worker());
     await Promise.all(ws);
 
     var blob = new Blob(parts, { type: 'application/octet-stream' });
     if (blob.size !== total) throw new Error('拼装后大小不对（' + blob.size + '/' + total + '）');
-    await putBlob(url, blob);
+    await putBlob(targetUrl, blob);
     if (onProgress) onProgress(1);
+    return blob.size;
+  }
+
+  // 依次试镜像，最后回落同源；全部失败才报错
+  async function grab(item, onProgress) {
+    if (await hasCached(item.url)) {
+      if (onProgress) onProgress(1);
+      return 'cache';
+    }
+    var sources = (item.mirrors || []).concat([item.url]);
+    var lastErr = null;
+    for (var i = 0; i < sources.length; i++) {
+      try {
+        await grabOne(sources[i], item.url, onProgress);
+        return sources[i] === item.url ? 'origin' : 'mirror';
+      } catch (e) {
+        lastErr = e;
+        if (onProgress) onProgress(0);
+      }
+    }
+    throw lastErr || new Error('下载失败');
   }
 
   async function putBlob(url, blob) {
@@ -534,14 +595,15 @@
     await c.put(url, new Response(blob, { headers: { 'Content-Type': 'application/octet-stream' } }));
   }
 
-  // 下载整包：onProgress({done, totalMb, file, pct})
+  // 下载整包：onProgress({doneMb, totalMb, file, pct, from})
   async function prefetchPack(onProgress) {
     var doneMb = 0;
+    var froms = {};
     for (var i = 0; i < PACK.length; i++) {
       var f = PACK[i];
       var base = doneMb;
       if (onProgress) onProgress({ doneMb: base, totalMb: PACK_MB, file: f.url.split('/').pop(), pct: (base / PACK_MB) * 100 });
-      await grab(f.url, function (r) {
+      var from = await grab(f, function (r) {
         if (onProgress) {
           onProgress({
             doneMb: base + f.mb * r,
@@ -551,11 +613,12 @@
           });
         }
       });
+      froms[from] = (froms[from] || 0) + 1;
       doneMb += f.mb;
     }
     cacheFlag = true;
     if (onProgress) onProgress({ doneMb: PACK_MB, totalMb: PACK_MB, file: '', pct: 100 });
-    return { doneMb: Math.round(PACK_MB * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10 };
+    return { doneMb: Math.round(PACK_MB * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10, froms: froms };
   }
 
   // ---------- 诊断 ----------
