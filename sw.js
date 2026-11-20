@@ -1,17 +1,17 @@
 /* 英语教练 · 离线缓存
    缓存优先、后台更新：装到主屏以后，断网也能打开，学的东西都还在。
    语音模型（whisper-tiny.en）单独一个缓存桶：第一次下载完就留在手机里。 */
-const CACHE = 'english-coach-v32';
+const CACHE = 'english-coach-v33';
 const MODEL_CACHE = 'english-coach-asr-v1';
 const ASSETS = [
   './',
   './index.html',
-  './styles.css?v=32',
-  './content.js?v=32',
-  './engine.js?v=32',
-  './asr.js?v=32',
-  './chat.js?v=32',
-  './app.js?v=32',
+  './styles.css?v=33',
+  './content.js?v=33',
+  './engine.js?v=33',
+  './asr.js?v=33',
+  './chat.js?v=33',
+  './app.js?v=33',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
