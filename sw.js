@@ -1,17 +1,17 @@
 /* 英语教练 · 离线缓存
    缓存优先、后台更新：装到主屏以后，断网也能打开，学的东西都还在。
    语音模型（whisper-tiny.en）单独一个缓存桶：第一次下载完就留在手机里。 */
-const CACHE = 'english-coach-v15';
+const CACHE = 'english-coach-v25';
 const MODEL_CACHE = 'english-coach-asr-v1';
 const ASSETS = [
   './',
   './index.html',
-  './styles.css?v=15',
-  './content.js?v=15',
-  './engine.js?v=15',
-  './asr.js?v=15',
-  './chat.js?v=15',
-  './app.js?v=15',
+  './styles.css?v=25',
+  './content.js?v=25',
+  './engine.js?v=25',
+  './asr.js?v=25',
+  './chat.js?v=25',
+  './app.js?v=25',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -52,8 +52,9 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // 语音模型：下过一次就永远用本地那份
-  if (url.pathname.indexOf('/whisper-tiny.en/') >= 0) {
+  // 语音模型 + onnxruntime 的 wasm：下过一次就永远用本地那份
+  // （放 MODEL_CACHE 桶，页面版本升级时不会被清掉，省得每次重下 20MB）
+  if (url.pathname.indexOf('/whisper-tiny.en/') >= 0 || /\.wasm$/.test(url.pathname)) {
     e.respondWith(
       caches.match(req).then((cached) => {
         if (cached) return cached;
