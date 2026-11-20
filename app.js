@@ -1130,9 +1130,11 @@ function talkBubbles() {
   // 这一练挑出来的错，攒成一份可以回头看的清单
   const fixes = t.msgs.filter((m) => m.role === 'ai' && m.fix).map((m) => m.fix);
   const polish = t.msgs.filter((m) => m.role === 'ai' && m.polish).map((m) => m.polish);
+  // 一条 fix 里可能塞了好几个错（a -> b；c -> d），按箭头数算「几处」
+  const points = fixes.reduce((n, f) => n + Math.max(1, (f.match(/->|→/g) || []).length), 0);
   const review = fixes.length
     ? `<details class="talk-review">
-        <summary>这一练我挑出 ${fixes.length} 处，回头再看一眼</summary>
+        <summary>这一练我挑出 ${points} 处，回头再看一眼</summary>
         <ul>${fixes.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
         ${polish.length ? `<div class="tr-sub">更地道的说法</div><ul>${polish.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
       </details>`
