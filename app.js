@@ -107,7 +107,11 @@ const StudyClock = {
 
   tick() {
     const now = Date.now();
-    if (!document.hidden && now - this.lastAct <= STUDY_IDLE_GAP) {
+    const quiet = now - this.lastAct;
+    // 看得见的时候，2 分钟没动作才停；切到后台只给 20 秒（有些 App 内浏览器
+    // 一直报 hidden，但你在点，照样得算上，否则时长会全是 0）
+    const limit = document.hidden ? 20000 : STUDY_IDLE_GAP;
+    if (quiet <= limit) {
       this.activeMs += Math.min(Math.max(0, now - this.lastAcc), 5000);
     }
     this.lastAcc = now;
