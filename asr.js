@@ -120,12 +120,33 @@
     return mod;
   }
 
+  // 先把语音包备好（走镜像，比让 transformers 自己去 GitHub Pages 拉快 50 倍）
+  async function ensurePack(onProgress) {
+    if (cacheFlag === true) return true;
+    var st = null;
+    try { st = await checkCache(); } catch (e) { st = null; }
+    if (st && st.complete) return true;
+    await prefetchPack(function (p) {
+      if (!onProgress) return;
+      try {
+        onProgress({
+          status: 'progress',
+          file: p.file || '语音包',
+          progress: p.pct,
+          overall: true,
+        });
+      } catch (e) {}
+    });
+    return true;
+  }
+
   async function load(onProgress) {
     if (pipe) { setState('ready'); return pipe; }
     if (loadingPromise) return loadingPromise;
     setState('loading');
     loadingPromise = (async function () {
       try {
+        await ensurePack(onProgress);
         var mod = await loadLib();
         var asr = await mod.pipeline('automatic-speech-recognition', MODEL_ID, {
           dtype: 'q8',
@@ -830,6 +851,7 @@
     hasBrowserSR: function () { return !!srCtor(); },
     setProgressHook: function (fn) { progressHook = fn; },
     prefetchPack: prefetchPack,
+    ensurePack: ensurePack,
     checkCache: checkCache,
     packMb: Math.round(PACK_MB),
     diagnose: diagnose,
