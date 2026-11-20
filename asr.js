@@ -510,9 +510,62 @@
     return { cachedMb: Math.round(got * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10, complete: cacheFlag };
   }
 
-  // 单个源：拿 Range 总量 → 分段并发（带重试）→ 拼成 Blob → cache.put(原 URL)
-  async function grabOne(src, targetUrl, onProgress) {
-    var probe = await fetch(src + (src.charAt(0) === '.' ? '?pf=1' : ''), { headers: { Range: 'bytes=0-0' } });
+  // 带「卡住就放弃」的保护：超过 stallMs 没有新数据就自己中断
+  async function fetchWithStall(url, opts, stallMs) {
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var opts2 = Object.assign({}, opts || {});
+    if (ctrl) opts2.signal = ctrl.signal;
+    var timer = null;
+    function bump() {
+      if (!ctrl) return;
+      clearTimeout(timer);
+      timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, stallMs || 25000);
+    }
+    bump();
+    try {
+      var res = await fetch(url, opts2);
+      return { res: res, bump: bump, done: function () { clearTimeout(timer); } };
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+  }
+
+  // 镜像（jsDelivr 这类跨域源）：整包一次 GET + 读流报进度。
+  // 别对它发 Range —— 实测 jsDelivr 对非 0 起点的 Range 会一直挂着不下来。
+  async function grabStream(src, targetUrl, onProgress) {
+    var h = await fetchWithStall(src, null, 25000);
+    var res = h.res;
+    if (!res.ok) { h.done(); throw new Error('HTTP ' + res.status); }
+    var total = Number(res.headers.get('Content-Length') || 0);
+    var chunks = [];
+    var got = 0;
+    if (res.body && res.body.getReader) {
+      var reader = res.body.getReader();
+      for (;;) {
+        var st = await reader.read();
+        if (st.done) break;
+        h.bump();
+        chunks.push(st.value);
+        got += st.value.byteLength;
+        if (onProgress && total) onProgress(Math.min(0.99, got / total));
+      }
+    } else {
+      var buf = await res.arrayBuffer();
+      chunks.push(new Uint8Array(buf));
+      got = buf.byteLength;
+    }
+    h.done();
+    if (!got) throw new Error('空文件');
+    await putBlob(targetUrl, new Blob(chunks, { type: 'application/octet-stream' }));
+    if (onProgress) onProgress(1);
+    return got;
+  }
+
+  // 同源（GitHub Pages 单流很慢）：拿 Range 总量 → 分段并发（带重试）
+  async function grabRange(src, targetUrl, onProgress) {
+    var suffix = src.charAt(0) === '.' ? '?pf=1' : '';
+    var probe = await fetch(src + suffix, { headers: { Range: 'bytes=0-0' } });
     if (!probe.ok && probe.status !== 206) throw new Error('HTTP ' + probe.status);
 
     var total = 0;
@@ -522,7 +575,6 @@
       if (mm) total = Number(mm[1]);
     }
     if (probe.status === 200) {
-      // 服务器不认 Range：整包下（探测那个响应本身就是全量）
       var blob0 = await probe.blob();
       if (!blob0.size) throw new Error('空文件');
       await putBlob(targetUrl, blob0);
@@ -532,7 +584,7 @@
     try { probe.body && probe.body.cancel && probe.body.cancel(); } catch (e) {}
     if (!total) throw new Error('读不到文件大小');
 
-    var CHUNK = 2 * 1024 * 1024;
+    var CHUNK = 3 * 1024 * 1024;
     var CONC = 4;
     var parts = new Array(Math.ceil(total / CHUNK));
     var next = 0;
@@ -544,14 +596,14 @@
       var lastErr = null;
       for (var attempt = 0; attempt < 3; attempt++) {
         try {
-          var res = await fetch(src + (src.charAt(0) === '.' ? '?pf=1' : ''), {
-            headers: { Range: 'bytes=' + start + '-' + end },
-          });
-          if (res.status !== 206) throw new Error('HTTP ' + res.status);
-          return await res.arrayBuffer();
+          var h = await fetchWithStall(src + suffix, { headers: { Range: 'bytes=' + start + '-' + end } }, 30000);
+          if (h.res.status !== 206) { h.done(); throw new Error('HTTP ' + h.res.status); }
+          var ab = await h.res.arrayBuffer();
+          h.done();
+          return ab;
         } catch (e) {
           lastErr = e;
-          await new Promise(function (r) { setTimeout(r, 400 * (attempt + 1)); });
+          await new Promise(function (r) { setTimeout(r, 500 * (attempt + 1)); });
         }
       }
       throw lastErr || new Error('分段失败');
@@ -563,7 +615,7 @@
         if (idx >= parts.length) return;
         parts[idx] = await fetchChunk(idx);
         doneBytes += parts[idx].byteLength;
-        if (onProgress) onProgress(Math.min(1, doneBytes / total));
+        if (onProgress) onProgress(Math.min(0.99, doneBytes / total));
       }
     }
 
@@ -578,17 +630,21 @@
     return blob.size;
   }
 
-  // 分片下载：每片独立走「镜像优先」，最后按顺序拼起来塞进缓存
+  function isCrossOrigin(src) {
+    return src.indexOf('http://') === 0 || src.indexOf('https://') === 0;
+  }
+
+  // 分片：每片独立走「镜像优先」，按顺序拼起来塞进缓存（30MB 的 decoder 靠这个绕开 20MB 上限）
   async function grabParts(item, onProgress) {
     var blobs = [];
     for (var i = 0; i < item.parts.length; i++) {
       var part = item.parts[i];
       var base = i / item.parts.length;
-      var from = await grab(
+      await grab(
         { url: part.url, mirrors: part.mirrors || [] },
-        function (r) {
-          if (onProgress) onProgress(base + r / item.parts.length);
-        }
+        (function (b) {
+          return function (r) { if (onProgress) onProgress(b + r / item.parts.length); };
+        })(base)
       );
       var c = await caches.open(CACHE_NAME);
       var hit = await c.match(part.url);
@@ -613,7 +669,8 @@
     var lastErr = null;
     for (var i = 0; i < sources.length; i++) {
       try {
-        await grabOne(sources[i], item.url, onProgress);
+        if (isCrossOrigin(sources[i])) await grabStream(sources[i], item.url, onProgress);
+        else await grabRange(sources[i], item.url, onProgress);
         return sources[i] === item.url ? 'origin' : 'mirror';
       } catch (e) {
         lastErr = e;
