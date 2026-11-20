@@ -752,7 +752,8 @@ async function handle(url, opts = {}) {
     }
 
     const minutes = Math.max(0, Math.min(180, Number(body.minutes) || 0));
-    day.minutes = Math.round((day.minutes || 0) + minutes);
+    // 实测时间会带小数（3.4 分钟），以前每笔都 Math.round 会把零头吃掉
+    day.minutes = Math.round(((day.minutes || 0) + minutes) * 10) / 10;
     day.items.push({
       type,
       key: body.key || null,
@@ -771,6 +772,18 @@ async function handle(url, opts = {}) {
       todayMinutes: day.minutes,
       progress: progressSummary(),
     };
+  }
+
+  // 中途关掉某一项：时间照记，但不算这项完成
+  if (route === '/api/time' && method === 'POST') {
+    const t = todayStr();
+    if (!state.days[t]) state.days[t] = { items: [], minutes: 0, notes: '', session: null };
+    const day = state.days[t];
+    const minutes = Math.max(0, Math.min(180, Number(body.minutes) || 0));
+    day.minutes = Math.round(((day.minutes || 0) + minutes) * 10) / 10;
+    day.partial = Math.round(((day.partial || 0) + minutes) * 10) / 10;
+    scheduleSave();
+    return { ok: true, todayMinutes: day.minutes, progress: progressSummary() };
   }
 
   if (route === '/api/note' && method === 'POST') {
