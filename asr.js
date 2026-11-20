@@ -52,8 +52,17 @@
       mb: 9.66,
       mirrors: [GH_MIRROR + 'whisper-tiny.en/onnx/encoder_model_quantized.onnx'],
     },
-    // 30MB，超 jsDelivr 单文件上限，没有镜像
-    { url: './whisper-tiny.en/onnx/decoder_model_merged_quantized.onnx', mb: 29.3, mirrors: [] },
+    // 30MB 超 jsDelivr 单文件上限，所以在仓库里切成两段 ~15MB 的分片，
+    // 从镜像分别拉下来再拼回去（拼完 md5 与原文件一致）
+    {
+      url: './whisper-tiny.en/onnx/decoder_model_merged_quantized.onnx',
+      mb: 29.3,
+      parts: [
+        { url: './whisper-tiny.en/onnx/parts/decoder.p1.bin', mb: 14.65, mirrors: [GH_MIRROR + 'whisper-tiny.en/onnx/parts/decoder.p1.bin'] },
+        { url: './whisper-tiny.en/onnx/parts/decoder.p2.bin', mb: 14.65, mirrors: [GH_MIRROR + 'whisper-tiny.en/onnx/parts/decoder.p2.bin'] },
+      ],
+      mirrors: [],
+    },
   ];
   var PACK_MB = PACK.reduce(function (n, x) { return n + x.mb; }, 0);
 
@@ -569,12 +578,37 @@
     return blob.size;
   }
 
+  // 分片下载：每片独立走「镜像优先」，最后按顺序拼起来塞进缓存
+  async function grabParts(item, onProgress) {
+    var blobs = [];
+    for (var i = 0; i < item.parts.length; i++) {
+      var part = item.parts[i];
+      var base = i / item.parts.length;
+      var from = await grab(
+        { url: part.url, mirrors: part.mirrors || [] },
+        function (r) {
+          if (onProgress) onProgress(base + r / item.parts.length);
+        }
+      );
+      var c = await caches.open(CACHE_NAME);
+      var hit = await c.match(part.url);
+      if (!hit) throw new Error('分片没下到：' + part.url);
+      blobs.push(await hit.blob());
+    }
+    var out = new Blob(blobs, { type: 'application/octet-stream' });
+    if (!out.size) throw new Error('拼装为空');
+    await putBlob(item.url, out);
+    if (onProgress) onProgress(1);
+    return 'parts(' + blobs.length + ')';
+  }
+
   // 依次试镜像，最后回落同源；全部失败才报错
   async function grab(item, onProgress) {
     if (await hasCached(item.url)) {
       if (onProgress) onProgress(1);
       return 'cache';
     }
+    if (item.parts && item.parts.length) return grabParts(item, onProgress);
     var sources = (item.mirrors || []).concat([item.url]);
     var lastErr = null;
     for (var i = 0; i < sources.length; i++) {
