@@ -1,42 +1,88 @@
-// 本地语音识别 + 跟读打分
-// 模型 whisper-tiny.en（量化 ONNX，约 42MB）与页面同源，放站点根 whisper-tiny.en/
-// 库用同源 vendor/transformers.min.js（ESM），避免依赖外网 CDN
+// 语音：本地 whisper（跟读打分）+ 手机自带识别（快速）双引擎
+// 关键改动：
+//  1) onnxruntime 的 wasm 从 jsDelivr 改成同源 vendor/ —— 国内 CDN 被墙时不再整个加载失败
+//  2) 两条路互为兜底：一条不通自动换另一条，并把真实原因给到界面
+//  3) 语音包可以提前并行分段下载（并发 4 段），下完塞进 Cache Storage，之后离线可用
 (function () {
   'use strict';
 
   var MODEL_ID = 'whisper-tiny.en';
   var LIB_URL = './vendor/transformers.min.js';
+  // wasm 放 ./vendor/：onnxruntime 用「字符串拼接」把前缀加上文件名，
+  // 但两个文件各自的基准不一样——
+  //   .wasm  → 相对【页面】（/），所以 './vendor/ort-wasm...wasm' 落在 /vendor/
+  //   .mjs   → 相对【transformers.min.js 所在目录】（/vendor/），于是成了 /vendor/vendor/
+  // 所以 .mjs 在 vendor/vendor/ 放了一份拷贝（44KB），两边都能命中。
+  var WASM_DIR = './vendor/';
   var MODEL_BASE = './';
   var CACHE_NAME = 'english-coach-asr-v1';
+  var PREF_KEY = 'english-coach-voice-v1';
+
+  // 语音包清单（第一次要下这些，之后永久离线可用）
+  var PACK = [
+    { url: './vendor/ort-wasm-simd-threaded.jsep.wasm', mb: 20.6 },
+    { url: './whisper-tiny.en/config.json', mb: 0.01 },
+    { url: './whisper-tiny.en/generation_config.json', mb: 0.01 },
+    { url: './whisper-tiny.en/preprocessor_config.json', mb: 0.01 },
+    { url: './whisper-tiny.en/tokenizer.json', mb: 2.03 },
+    { url: './whisper-tiny.en/tokenizer_config.json', mb: 0.01 },
+    { url: './whisper-tiny.en/onnx/encoder_model_quantized.onnx', mb: 9.66 },
+    { url: './whisper-tiny.en/onnx/decoder_model_merged_quantized.onnx', mb: 29.3 },
+  ];
+  var PACK_MB = PACK.reduce(function (n, x) { return n + x.mb; }, 0);
 
   var pipe = null;
   var loadingPromise = null;
   var state = 'idle'; // idle | loading | ready | failed
   var lastError = '';
+  var lastErrorCode = '';
+  var cacheFlag = null; // null=未知 true=已缓存 false=没缓存
+  var progressHook = null; // 界面挂一次就好，加载过程中一直能收到进度
 
-  function setState(s, err) {
+  function setState(s, err, code) {
     state = s;
-    if (err) lastError = String(err && err.message ? err.message : err);
+    if (err) {
+      lastError = String(err && err.message ? err.message : err);
+      lastErrorCode = code || '';
+    }
+  }
+
+  function pref() {
+    try {
+      var v = localStorage.getItem(PREF_KEY);
+      if (v === 'browser' || v === 'local') return v;
+    } catch (e) {}
+    return 'auto';
+  }
+  function setPref(v) {
+    try {
+      if (v === 'browser' || v === 'local' || v === 'auto') localStorage.setItem(PREF_KEY, v);
+    } catch (e) {}
   }
 
   function hasMic() {
     return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   }
 
+  function srCtor() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  // ---------- 加载本地模型 ----------
+
   async function loadLib() {
     var mod = await import(LIB_URL);
     mod.env.allowRemoteModels = false;
     mod.env.allowLocalModels = true;
     mod.env.localModelPath = MODEL_BASE;
+    // 关键：把 ort 的 wasm 指到同源目录
+    var w = mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm;
+    if (w) {
+      w.wasmPaths = WASM_DIR;
+      w.proxy = false;
+      w.numThreads = 1; // 手机上没有 SharedArrayBuffer，单线程最稳
+    }
     return mod;
-  }
-
-  // 把已下载的文件塞进 Cache Storage，下次直接命中
-  function rememberResponse(url, res) {
-    if (!res || !res.ok || !window.caches) return;
-    try {
-      caches.open(CACHE_NAME).then(function (c) { c.put(url, res.clone()); }).catch(function () {});
-    } catch (e) {}
   }
 
   async function load(onProgress) {
@@ -48,22 +94,40 @@
         var mod = await loadLib();
         var asr = await mod.pipeline('automatic-speech-recognition', MODEL_ID, {
           dtype: 'q8',
+          device: 'wasm',
           progress_callback: function (p) {
-            try {
-              if (onProgress) onProgress(p);
-            } catch (e) {}
+            try { if (onProgress) onProgress(p); } catch (e) {}
+            try { if (progressHook) progressHook(p); } catch (e) {}
           },
         });
         pipe = asr;
         setState('ready');
+        cacheFlag = true;
         return asr;
       } catch (e) {
-        setState('failed', e);
+        var code = 'L_FAIL';
+        var msg = String((e && e.message) || e);
+        if (/fetch|network|Failed to load|import|dynamically imported/i.test(msg)) code = 'L_NET';
+        if (/wasm|ort|WebAssembly/i.test(msg)) code = 'L_WASM';
+        if (/quota|storage|QuotaExceeded/i.test(msg)) code = 'L_QUOTA';
+        setState('failed', e, code);
         loadingPromise = null;
-        throw e;
+        var err = new Error(describeCode(code, msg));
+        err.code = code;
+        err.raw = msg;
+        throw err;
       }
     })();
     return loadingPromise;
+  }
+
+  // whisper 在没有人声时会吐 [BLANK_AUDIO] / [MUSIC] 这类占位串，当没听到处理
+  function cleanText(t) {
+    var s = String(t || '').trim();
+    if (!s) return '';
+    if (/^[\[\(（【].*[\]\)）】]$/.test(s)) return '';
+    s = s.replace(/\[BLANK_AUDIO\]|\(silence\)|\[MUSIC\]|\[NOISE\]/gi, '').trim();
+    return s;
   }
 
   async function transcribe(audio32) {
@@ -71,7 +135,8 @@
     var t = performance.now();
     var out = await asr(audio32);
     return {
-      text: String((out && out.text) || '').trim(),
+      text: cleanText(out && out.text),
+      raw: String((out && out.text) || '').trim(),
       ms: Math.round(performance.now() - t),
     };
   }
@@ -93,29 +158,77 @@
     return out;
   }
 
+  function micError(e) {
+    var name = (e && e.name) || '';
+    var err;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      err = new Error('麦克风权限被拦了。点地址栏左边的小锁，把「麦克风」改成允许，再试一次。');
+      err.code = 'M_DENIED';
+    } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      err = new Error('这台设备没找到可用的麦克风。');
+      err.code = 'M_NONE';
+    } else if (name === 'NotReadableError') {
+      err = new Error('麦克风被别的 App 占着，关掉它（比如语音通话）再试。');
+      err.code = 'M_BUSY';
+    } else {
+      err = new Error('打不开麦克风：' + ((e && e.message) || name || '未知原因'));
+      err.code = 'M_FAIL';
+    }
+    return err;
+  }
+
   // 录一段话：自动检测说话开始与停顿结束
-  // opts: { maxMs, silenceMs, threshold, onLevel }
+  // opts: { maxMs, silenceMs, threshold, onLevel, noSpeechMs }
   async function record(opts) {
     opts = opts || {};
     var maxMs = opts.maxMs || 15000;
     var silenceMs = opts.silenceMs || 1200;
     var threshold = opts.threshold || 0.014;
-    if (!hasMic()) throw new Error('这个浏览器拿不到麦克风');
+    if (!hasMic()) {
+      var ne = new Error('这个浏览器拿不到麦克风（不支持录音接口）。');
+      ne.code = 'M_UNSUPPORTED';
+      throw ne;
+    }
 
-    var stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+    // 有些浏览器会把「等你点允许」的框挂在那儿不给回调，必须自己设个上限，
+    // 否则界面永远停在「正在听」
+    var stream;
+    try {
+      stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        }),
+        new Promise(function (_, reject) {
+          setTimeout(function () {
+            var te = new Error('还没拿到麦克风权限。看一下地址栏左边的锁或屏幕上的提示，点「允许」再试。');
+            te.code = 'M_WAIT';
+            reject(te);
+          }, opts.getUserMediaMs || 20000);
+        }),
+      ]);
+    } catch (e) {
+      throw (e && e.code === 'M_WAIT' ? e : micError(e));
+    }
 
     var ctx;
     try {
-      ctx = new AudioContext({ sampleRate: 16000 });
+      ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     } catch (e) {
-      ctx = new AudioContext();
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
     }
     if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
 
     var src = ctx.createMediaStreamSource(stream);
-    var proc = ctx.createScriptProcessor(4096, 1, 1);
+    var proc;
+    try {
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+    } catch (e) {
+      try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e2) {}
+      try { ctx.close(); } catch (e2) {}
+      var pe = new Error('这个浏览器的录音接口被关掉了（createScriptProcessor 不可用）。换 Chrome / Edge 试试。');
+      pe.code = 'M_UNSUPPORTED';
+      throw pe;
+    }
     var chunks = [];
     var startedAt = performance.now();
     var spoke = false;
@@ -123,7 +236,7 @@
 
     return new Promise(function (resolve, reject) {
       var finished = false;
-      var hardTimer = setTimeout(function () { finish('timeout'); }, maxMs + 500);
+      var hardTimer = setTimeout(function () { finish('timeout'); }, maxMs + 900);
       // 没有音频回调（设备没输入）时也要能自己收尾
       var ticker = setInterval(function () {
         if (finished) return;
@@ -150,9 +263,11 @@
         var all = new Float32Array(total);
         var off = 0;
         for (var i = 0; i < chunks.length; i++) { all.set(chunks[i], off); off += chunks[i].length; }
-        var audio = ctx.sampleRate === 16000 ? all : resampleTo16k(all, ctx.sampleRate);
+        var rate = ctx.sampleRate || 16000;
+        var audio = rate === 16000 ? all : resampleTo16k(all, rate);
         resolve({
           audio: audio,
+          ok: !!spoke && audio.length > 1600,
           seconds: Math.round((audio.length / 16000) * 10) / 10,
           reason: reason,
           spoke: spoke,
@@ -179,7 +294,6 @@
           finish('silence');
           return;
         }
-        // 一直没人说话：别让用户干等
         if (!spoke && now - startedAt > (opts.noSpeechMs || 4000)) {
           finish('nospeech');
           return;
@@ -190,6 +304,292 @@
       src.connect(proc);
       proc.connect(ctx.destination);
     });
+  }
+
+  // ---------- 手机自带识别（Web Speech API） ----------
+
+  function srError(code) {
+    var map = {
+      'not-allowed': ['S_DENIED', '麦克风权限被拦了，允许之后再试。'],
+      'service-not-allowed': ['S_DENIED', '这台设备不允许网页用识别服务。'],
+      'no-speech': ['S_NOSPEECH', '没听到声音。'],
+      network: ['S_NET', '手机自带识别要联网，现在连不上（国内网络常见）。'],
+      'audio-capture': ['S_MIC', '抓不到麦克风的声音。'],
+      aborted: ['S_ABORT', '这一次被中断了。'],
+      'language-not-supported': ['S_LANG', '这台设备的识别不支持英语。'],
+      'start-failed': ['S_START', '识别没能启动。'],
+      timeout: ['S_TIMEOUT', '没听到你说话，我停了。'],
+    };
+    var m = map[code] || ['S_FAIL', '手机自带识别出错（' + code + '）。'];
+    var e = new Error(m[1]);
+    e.code = m[0];
+    e.raw = code;
+    return e;
+  }
+
+  function browserListen(opts) {
+    opts = opts || {};
+    return new Promise(function (resolve, reject) {
+      var C = srCtor();
+      if (!C) {
+        var e0 = new Error('这个浏览器不带语音识别接口。');
+        e0.code = 'S_UNSUPPORTED';
+        return reject(e0);
+      }
+      var r;
+      try {
+        r = new C();
+      } catch (e) {
+        return reject(srError('start-failed'));
+      }
+      r.lang = 'en-US';
+      r.interimResults = false;
+      r.continuous = false;
+      r.maxAlternatives = 1;
+
+      var done = false;
+      var t0 = performance.now();
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        try { r.abort(); } catch (e) {}
+        reject(srError('timeout'));
+      }, opts.maxMs || 12000);
+
+      function done_() {
+        done = true;
+        clearTimeout(timer);
+        try { r.onresult = null; r.onerror = null; r.onend = null; } catch (e) {}
+      }
+
+      r.onresult = function (ev) {
+        if (done) return;
+        var txt = '';
+        try {
+          for (var i = ev.resultIndex; i < ev.results.length; i++) txt += ev.results[i][0].transcript;
+        } catch (e) {}
+        done_();
+        var text = String(txt || '').trim();
+        if (!text) return reject(srError('no-speech'));
+        resolve({ text: text, engine: 'browser', ms: Math.round(performance.now() - t0), seconds: 0 });
+      };
+      r.onerror = function (ev) {
+        if (done) return;
+        done_();
+        reject(srError((ev && ev.error) || 'error'));
+      };
+      r.onend = function () {
+        if (done) return;
+        done_();
+        reject(srError('no-speech'));
+      };
+      try {
+        r.start();
+      } catch (e) {
+        done_();
+        reject(srError('start-failed'));
+      }
+    });
+  }
+
+  // ---------- 统一入口 ----------
+  // opts: { engine:'auto'|'browser'|'local', prefer:'speed'|'accuracy', maxMs, onLevel, onStage }
+  // 返回 { text, engine, ms, seconds }
+  async function listen(opts) {
+    opts = opts || {};
+    var p = opts.engine || pref();
+    var order;
+    if (p === 'browser') order = ['browser', 'local'];
+    else if (p === 'local') order = ['local'];
+    else if (srCtor() && opts.prefer === 'speed') order = ['browser', 'local'];
+    else order = ['local', 'browser'];
+
+    var tries = [];
+    var lastErr = null;
+    for (var i = 0; i < order.length; i++) {
+      var eng = order[i];
+      if (opts.onStage) { try { opts.onStage(eng); } catch (e) {} }
+      try {
+        if (eng === 'browser') {
+          if (opts.onStage) { try { opts.onStage('browser:record'); } catch (e) {} }
+          var b = await browserListen({ maxMs: opts.maxMs || 12000 });
+          b.tried = tries;
+          return b;
+        }
+        if (!pipe && opts.onStage) { try { opts.onStage('local:load'); } catch (e) {} }
+        if (opts.onStage) { try { opts.onStage('local:record'); } catch (e) {} }
+        var rec = await record({
+          maxMs: opts.maxMs || 15000,
+          onLevel: opts.onLevel,
+          noSpeechMs: opts.noSpeechMs,
+          silenceMs: opts.silenceMs,
+        });
+        if (!rec.spoke || !rec.audio || rec.audio.length < 1600) {
+          var ne = new Error(rec.reason === 'nospeech' ? '没听到你说英语，再说一次？' : '这次没录上声音。');
+          ne.code = 'S_NOSPEECH';
+          throw ne;
+        }
+        if (opts.onStage) { try { opts.onStage('local:transcribe'); } catch (e) {} }
+        var out = await transcribe(rec.audio);
+        if (!out.text) {
+          var te = new Error('这句没听清，靠近一点再说一次。');
+          te.code = 'S_EMPTY';
+          throw te;
+        }
+        return { text: out.text, engine: 'local', ms: out.ms, seconds: rec.seconds, tried: tries };
+      } catch (e) {
+        lastErr = e;
+        tries.push(eng + ':' + (e.code || e.message));
+        // 权限被拒 / 没麦克风：换引擎也没用，直接报
+        if (e.code === 'M_DENIED' || e.code === 'M_UNSUPPORTED' || e.code === 'S_DENIED' || e.code === 'M_NONE') break;
+        // 用户确实没说话：别自动换引擎，会让人等两遍
+        if (e.code === 'S_NOSPEECH' && eng === 'local') break;
+      }
+    }
+    var err = lastErr || new Error('语音没跑起来。');
+    err.tried = tries;
+    throw err;
+  }
+
+  // ---------- 语音包预下载（分段并发 + 塞进 Cache Storage） ----------
+
+  // 全桶找：模型文件在 asr 桶里，wasm 可能被 Service Worker 塞进页面缓存桶
+  async function hasCached(url) {
+    if (!window.caches) return false;
+    try {
+      var hit = await caches.match(url);
+      return !!hit;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function checkCache(onItem) {
+    var got = 0;
+    for (var i = 0; i < PACK.length; i++) {
+      var y = await hasCached(PACK[i].url);
+      if (y) got += PACK[i].mb;
+      if (onItem) { try { onItem(PACK[i], y); } catch (e) {} }
+    }
+    cacheFlag = got >= PACK_MB - 1;
+    return { cachedMb: Math.round(got * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10, complete: cacheFlag };
+  }
+
+  // 单文件：拿 Range 总量 → 分段并发 → 拼成 Blob → cache.put(原 URL)
+  async function grab(url, onProgress) {
+    if (await hasCached(url)) {
+      if (onProgress) onProgress(1);
+      return;
+    }
+    var probe = await fetch(url + '?pf=1', { headers: { Range: 'bytes=0-0' } });
+    if (!probe.ok && probe.status !== 206) throw new Error('拿不到 ' + url + '（HTTP ' + probe.status + '）');
+    var total = 0;
+    var cr = probe.headers.get('Content-Range');
+    if (probe.status === 206 && cr) {
+      var m = /\/(\d+)\s*$/.exec(cr);
+      if (m) total = Number(m[1]);
+    }
+    if (probe.status === 200) {
+      // 服务器不认 Range：只能整包下
+      var blob0 = await probe.blob();
+      await putBlob(url, blob0);
+      if (onProgress) onProgress(1);
+      return;
+    }
+    try { probe.body && probe.body.cancel && probe.body.cancel(); } catch (e) {}
+    if (!total) throw new Error('读不到文件大小');
+
+    var CHUNK = 2 * 1024 * 1024;
+    var CONC = 4;
+    var parts = new Array(Math.ceil(total / CHUNK));
+    var next = 0;
+    var doneBytes = 0;
+
+    async function worker() {
+      for (;;) {
+        var idx = next++;
+        if (idx >= parts.length) return;
+        var start = idx * CHUNK;
+        var end = Math.min(total - 1, start + CHUNK - 1);
+        var res = await fetch(url + '?pf=1', { headers: { Range: 'bytes=' + start + '-' + end } });
+        if (res.status !== 206) throw new Error('分段下载失败（HTTP ' + res.status + '）');
+        parts[idx] = await res.arrayBuffer();
+        doneBytes += parts[idx].byteLength;
+        if (onProgress) onProgress(Math.min(1, doneBytes / total));
+      }
+    }
+    var ws = [];
+    for (var k = 0; k < CONC; k++) ws.push(worker());
+    await Promise.all(ws);
+
+    var blob = new Blob(parts, { type: 'application/octet-stream' });
+    if (blob.size !== total) throw new Error('拼装后大小不对（' + blob.size + '/' + total + '）');
+    await putBlob(url, blob);
+    if (onProgress) onProgress(1);
+  }
+
+  async function putBlob(url, blob) {
+    if (!window.caches) return;
+    var c = await caches.open(CACHE_NAME);
+    await c.put(url, new Response(blob, { headers: { 'Content-Type': 'application/octet-stream' } }));
+  }
+
+  // 下载整包：onProgress({done, totalMb, file, pct})
+  async function prefetchPack(onProgress) {
+    var doneMb = 0;
+    for (var i = 0; i < PACK.length; i++) {
+      var f = PACK[i];
+      var base = doneMb;
+      if (onProgress) onProgress({ doneMb: base, totalMb: PACK_MB, file: f.url.split('/').pop(), pct: (base / PACK_MB) * 100 });
+      await grab(f.url, function (r) {
+        if (onProgress) {
+          onProgress({
+            doneMb: base + f.mb * r,
+            totalMb: PACK_MB,
+            file: f.url.split('/').pop(),
+            pct: ((base + f.mb * r) / PACK_MB) * 100,
+          });
+        }
+      });
+      doneMb += f.mb;
+    }
+    cacheFlag = true;
+    if (onProgress) onProgress({ doneMb: PACK_MB, totalMb: PACK_MB, file: '', pct: 100 });
+    return { doneMb: Math.round(PACK_MB * 10) / 10, totalMb: Math.round(PACK_MB * 10) / 10 };
+  }
+
+  // ---------- 诊断 ----------
+
+  function diagnose() {
+    var wasmOk = false;
+    try { wasmOk = typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function'; } catch (e) {}
+    return {
+      mic: hasMic(),
+      secure: !!window.isSecureContext,
+      sr: !!srCtor(),
+      wasm: wasmOk,
+      pref: pref(),
+      state: state,
+      error: lastError,
+      errorCode: lastErrorCode,
+      cached: cacheFlag,
+      packMb: Math.round(PACK_MB),
+      cores: navigator.hardwareConcurrency || 0,
+      ua: navigator.userAgent,
+    };
+  }
+
+  function describeCode(code, raw) {
+    if (code === 'L_WASM') return '语音引擎（wasm）没加载起来：' + (raw || '').slice(0, 120);
+    if (code === 'L_NET') return '语音包下载失败，检查下网络再试（第一次要下约 ' + Math.round(PACK_MB) + 'MB）。';
+    if (code === 'L_QUOTA') return '手机空间不够存语音包，清一点空间再试。';
+    return '语音模型没加载上：' + (raw || '').slice(0, 120);
+  }
+
+  function describe(e) {
+    if (!e) return '语音出错。';
+    if (e.code === 'S_NOSPEECH') return '没听到你说话。';
+    return String(e.message || e);
   }
 
   // ---------- 打分 ----------
@@ -216,7 +616,6 @@
     return NUMBER_WORDS[base] || base;
   }
 
-  // 最长公共子序列对齐：返回目标句每个词是否被说中
   function alignFlags(target, heard) {
     var n = target.length;
     var m = heard.length;
@@ -272,11 +671,24 @@
     load: load,
     transcribe: transcribe,
     record: record,
+    listen: listen,
+    browserListen: browserListen,
+    hasBrowserSR: function () { return !!srCtor(); },
+    setProgressHook: function (fn) { progressHook = fn; },
+    prefetchPack: prefetchPack,
+    checkCache: checkCache,
+    packMb: Math.round(PACK_MB),
+    diagnose: diagnose,
+    describe: describe,
+    pref: pref,
+    setPref: setPref,
     scoreReading: scoreReading,
     tokenize: tokenize,
     hasMic: hasMic,
     get state() { return state; },
     get error() { return lastError; },
+    get errorCode() { return lastErrorCode; },
     get ready() { return !!pipe; },
+    get cached() { return cacheFlag; },
   };
 })();
